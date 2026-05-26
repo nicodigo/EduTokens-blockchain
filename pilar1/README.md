@@ -69,3 +69,31 @@ En este hit el kernel usa un único thread porque el objetivo es verificar la co
 [Enlace a notebook de ejemplo](https://colab.research.google.com/drive/1r7fDcrWiaH0iF8MpN1g6A26LuKb1CnVF?usp=sharing)
 
 ---
+
+### Hit 5 — Búsqueda de nonce por fuerza bruta con CUDA
+
+El programa `pilar1/md5_bruteforce/md5_bruteforce.cu` recibe un string base y un prefijo hexadecimal target, y encuentra por fuerza bruta un nonce entero tal que `MD5(base + nonce)` comience con ese prefijo.
+
+**Estrategia de paralelización**
+
+El kernel lanza 1280 bloques de 256 threads, totalizando 327.680 threads activos. Cada thread recibe como nonce de partida su índice global y avanza de a 327.680 en cada iteración (grid-stride loop). De esta forma el espacio de búsqueda se cubre en franjas paralelas sin superposición: el thread 0 prueba los nonces 0, 327680, 655360, ...; el thread 1 prueba 1, 327681, 655361, y así sucesivamente.
+
+Dentro de cada iteración el thread construye el string `base + nonce` en un buffer local, aplica el padding RFC 1321, calcula el MD5 llamando a `md5_transform` de `md5.cuh`, y compara los nibbles iniciales del digest contra el prefijo target.
+
+**Mecanismo de terminación**
+
+Se usa una flag entera en memoria global del device inicializada en 0. El primer thread que encuentra una solución válida ejecuta `atomicExch(found_flag, 1)`. Si el valor anterior era 0, ese thread escribe el nonce y el hash en memoria global y termina. Los demás threads leen la flag al inicio de cada iteración con `atomicAdd(found_flag, 0)` y retornan si ya vale 1. Esto garantiza que exactamente un resultado se escribe aunque múltiples threads encuentren soluciones simultáneamente.
+
+**Verificación**
+
+```
+MD5(blockchain17354)      = 007b5665...   prefijo "00"       ✓
+MD5(blockchain10941)      = 00009e1c...   prefijo "0000"     ✓
+MD5(blockchain2144346197) = 00000000...   prefijo "00000000" ✓
+```
+
+Los tres resultados son verificables independientemente con cualquier implementación estándar de MD5.
+
+[Enlace a notebook de ejemplo](https://colab.research.google.com/drive/1B3qJQMFga3Wey6bhy-Vn3YzIgv_7Mbkv?usp=sharing)
+
+---
