@@ -53,3 +53,19 @@ El orden ascendente confirma que el sort operó correctamente. La compilación s
 [Enlace a notebook de ejemplo](https://colab.research.google.com/drive/11zPMZA-e8fDbuRSopGlWePngFjcQjt5K?usp=sharing)
 
 ---
+
+### Hit 4 — Cálculo de MD5 con CUDA
+
+El programa `pilar1/md5/md5_cuda.cu` recibe un string por argumento, calcula su MD5 en GPU y devuelve el hash en hexadecimal por consola.
+
+La implementación se divide en dos archivos. `md5.cuh` contiene las funciones del algoritmo MD5 marcadas `__device__`, lo que permite que sean llamadas desde kernels. Implementa las cuatro funciones de ronda (F, G, H, I), la rotación de bits, y `md5_transform` que procesa un bloque de 64 bytes mutando el estado interno de cuatro palabras de 32 bits. `md5_cuda.cu` contiene el kernel y el main.
+
+El flujo de ejecución es el siguiente. El host aplica el padding definido por RFC 1321: se agrega el byte 0x80 al final del mensaje, se rellena con ceros hasta que la longitud sea congruente a 56 mod 64, y se agregan 8 bytes con la longitud original del mensaje en bits en formato little-endian. El mensaje paddeado se copia a memoria del device. El kernel lanza un único thread que itera sobre todos los bloques de 64 bytes llamando a `md5_transform` en cada uno, y escribe el digest de 16 bytes en memoria del device. El host copia el digest de vuelta e imprime los 16 bytes en hex.
+
+La verificación con el string "hello" produjo `5d41402abc4b2a76b9719d911017c592`, que coincide con el valor de referencia conocido del algoritmo MD5.
+
+En este hit el kernel usa un único thread porque el objetivo es verificar la corrección de la implementación antes de paralelizarla. La ventaja de GPU no aparece hasta el Hit 5, donde miles de threads calculan hashes distintos en paralelo.
+
+[Enlace a notebook de ejemplo](https://colab.research.google.com/drive/1r7fDcrWiaH0iF8MpN1g6A26LuKb1CnVF?usp=sharing)
+
+---
