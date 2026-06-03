@@ -471,3 +471,77 @@ Los tests cubren:
 - `NCTState.get_active_worker_count`: workers activos, expiración por timeout
 - `NCTState.active_workers_snapshot`: orden alfabético
 - Actualización de heartbeat resetea el timer de expiración
+
+---
+
+## 2.7 — Endpoints de Health/Status y Logging
+
+### Endpoints de salud para cada servicio
+
+Cada servicio expone un endpoint HTTP mínimo con `http.server` (stdlib, sin dependencias):
+
+| Servicio | Puerto | Endpoints |
+|---|---|---|
+| NCT | `8080` | `GET /health`, `GET /status`, `POST /transaction` |
+| Worker | `8081` (configurable) | `GET /health`, `GET /status` |
+| Redis | `6379` | Healthcheck interno (Docker) |
+| RabbitMQ | `15672` | Management UI + healthcheck interno (Docker) |
+
+**Respuestas:**
+
+```
+GET /health → {"status": "ok", "worker_id": "worker-1", "uptime_seconds": 42.3}
+GET /status → {"worker_id": "worker-1", "current_task": "...", "tasks_processed": 5, ...}
+```
+
+Los workers se identifican con `WORKER_ID` (env var) o un UUID autogenerado. Esto permite distinguir instancias en los logs y en el panel de RabbitMQ.
+
+### Logging a disco
+
+Ambos servicios (NCT y Worker) soportan logging dual: stdout + archivo.
+
+```python
+# Configurable via env var LOG_FILE
+LOG_FILE=/var/log/nct.log     # NCT
+LOG_FILE=/var/log/worker-1.log # Worker
+```
+
+Si `LOG_FILE` no está definido, el log va solo a stdout (modo desarrollo). En Docker, se define apuntando a un path dentro del contenedor.
+
+Formato: `2026-06-03 14:22:01,234 [nct.nct] INFO Block 1 mined by worker-1 (nonce=10941)`
+
+### Decisión de diseño: sin Prometheus/Grafana
+
+La consigna menciona observabilidad (U5.5) pero para el alcance del TP:
+
+- Los endpoints `/health` + `/status` cubren el monitoreo básico requerido por la consigna ("endpoint público para cada servicio que permita verificar el estado")
+- Prometheus + Grafana se agregarían como servicios externos al `docker-compose.yml` (no requieren código Python)
+- Los logs en disco son el mecanismo de auditoría ("registros de actividades en memoria y disco")
+
+### Docker Compose
+
+El compose ahora expone puertos de health para todos los servicios Python:
+
+```
+nct       → :8080  (health + transaction API)
+worker-1  → :8081  (health)
+worker-2  → :8082  (health)
+redis     → :6379
+rabbitmq  → :5672 (AMQP) + :15672 (Management UI)
+```
+
+Cada worker es un servicio independiente con su propio `WORKER_ID`, `HEALTH_PORT` y `LOG_FILE`. Esto permite verificar cada instancia individualmente.
+
+### Tests
+
+Archivo: `tests/test_health.py`
+
+```bash
+cd pilar2 && uv run python -m unittest tests/test_health.py -v
+```
+
+Los tests cubren:
+- `GET /health` → 200 + JSON con `status: "ok"`
+- `GET /status` → 200 + JSON con campos esperados
+- Ruta inexistente → 404
+- Default `HEALTH_PORT` = 8081

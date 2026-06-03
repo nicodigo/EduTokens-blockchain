@@ -16,6 +16,9 @@ import time
 import uuid
 from typing import Any, Optional
 
+import uvicorn
+from fastapi import FastAPI
+
 from broker.broker import (
     CONTROL_ROUTING_KEY,
     EXCHANGE,
@@ -26,6 +29,11 @@ from broker.broker import (
 )
 from broker.messages import ControlMessage, ResultMessage, TaskMessage
 from miner.miner import MinerService
+from shared.schemas import (
+    HealthResponse,
+    WorkerHealthResponse,
+    WorkerStatusResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +42,36 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_HEARTBEAT_INTERVAL = 5.0
+DEFAULT_HEALTH_PORT = 8081
+
+# ---------------------------------------------------------------------------
+# FastAPI health application (runs in its own thread)
+# ---------------------------------------------------------------------------
+
+
+def _create_health_app(worker: WorkerService) -> FastAPI:
+    """Build a FastAPI app wired to a single worker instance."""
+
+    app = FastAPI(title=f"Worker {worker.worker_id}", version="1.0.0")
+
+    def _uptime() -> float:
+        return round(time.time() - worker.start_time, 1) if worker.start_time else 0.0
+
+    @app.get("/health", response_model=HealthResponse)
+    def health() -> HealthResponse:
+        return HealthResponse(status="ok")
+
+    @app.get("/status", response_model=WorkerStatusResponse)
+    def status() -> WorkerStatusResponse:
+        return WorkerStatusResponse(
+            worker_id=worker.worker_id,
+            current_task=worker._current_task_id,
+            tasks_processed=worker.tasks_processed,
+            uptime_seconds=_uptime(),
+        )
+
+    return app
+
 
 # ---------------------------------------------------------------------------
 # WorkerService
@@ -43,8 +81,8 @@ DEFAULT_HEARTBEAT_INTERVAL = 5.0
 class WorkerService:
     """Long-running process that mines blocks on demand.
 
-    Connects to RabbitMQ, registers with the NCT, and processes mining
-    tasks in a loop.  Control messages (abort) cancel in-flight work.
+    Connects to RabbitMQ, registers with the NCT, processes mining tasks,
+    and exposes a health HTTP endpoint.
     """
 
     def __init__(
@@ -53,42 +91,54 @@ class WorkerService:
         rmq_url: str,
         miner_binary: str = "./md5_range",
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+        health_port: int = DEFAULT_HEALTH_PORT,
     ) -> None:
         self.worker_id = worker_id
         self.rmq_url = rmq_url
         self.miner = MinerService(binary_path=miner_binary)
         self.heartbeat_interval = heartbeat_interval
+        self.health_port = health_port
 
         # Mutable state
         self._current_task_id: Optional[str] = None
         self._aborted: threading.Event = threading.Event()
         self._shutdown: threading.Event = threading.Event()
         self._channel: Any = None
+        self.tasks_processed: int = 0
+        self.start_time: float = 0.0
 
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
 
     def run(self) -> None:
+        self.start_time = time.time()
         conn = get_connection(url=self.rmq_url)
         self._channel = conn.channel()
         declare_topology(self._channel)
 
-        # Register immediately
-        self._send_heartbeat()
+        # Register immediately (safe — called from main thread before start_consuming)
+        self._send_heartbeat(self._channel)
 
         # Background heartbeat thread
-        heartbeat_thread = threading.Thread(
+        threading.Thread(
             target=self._heartbeat_loop, daemon=True, name="heartbeat",
-        )
-        heartbeat_thread.start()
+        ).start()
+
+        # Health HTTP server thread (FastAPI via uvicorn)
+        health_app = _create_health_app(self)
+        threading.Thread(
+            target=self._run_health_server, args=(health_app,), daemon=True,
+            name="health-server",
+        ).start()
 
         # Control listener (abort signals)
         self._setup_control_listener()
 
-        # Task consumer (blocking)
+        # Task consumer (blocking — must be last)
         self._setup_task_consumer()
-        logger.info("Worker %s ready — waiting for mining tasks", self.worker_id)
+        logger.info("Worker %s ready — health on :%d, waiting for mining tasks",
+                     self.worker_id, self.health_port)
         self._channel.start_consuming()
 
     def shutdown(self) -> None:
@@ -100,27 +150,39 @@ class WorkerService:
                 pass
 
     # ------------------------------------------------------------------
+    # Health HTTP server
+    # ------------------------------------------------------------------
+
+    def _run_health_server(self, app: FastAPI) -> None:
+        logger.info("Worker health server listening on port %d", self.health_port)
+        uvicorn.run(app, host="0.0.0.0", port=self.health_port, log_level="warning")
+
+    # ------------------------------------------------------------------
     # Heartbeat
     # ------------------------------------------------------------------
 
-    def _send_heartbeat(self) -> None:
+    def _send_heartbeat(self, channel: Any) -> None:
         msg = {
             "worker_id": self.worker_id,
             "action": "heartbeat",
             "timestamp": time.time(),
         }
-        self._channel.basic_publish(
+        channel.basic_publish(
             exchange=EXCHANGE,
             routing_key="worker.heartbeat",
             body=json.dumps(msg, sort_keys=True),
         )
 
     def _heartbeat_loop(self) -> None:
+        # Open a dedicated connection so we never share a channel across threads.
+        hb_conn = get_connection(url=self.rmq_url)
+        hb_channel = hb_conn.channel()
+
         while not self._shutdown.is_set():
             self._shutdown.wait(timeout=self.heartbeat_interval)
             if not self._shutdown.is_set():
                 try:
-                    self._send_heartbeat()
+                    self._send_heartbeat(hb_channel)
                 except Exception:
                     logger.warning("Heartbeat send failed (connection may be down)")
 
@@ -169,10 +231,8 @@ class WorkerService:
         self._current_task_id = task.task_id
         self._aborted.clear()
 
-        # Convert difficulty (int) → target prefix (string)
         target_prefix = "0" * task.difficulty
 
-        # Mine
         result = self.miner.mine(
             base_string=task.fingerprint,
             target_prefix=target_prefix,
@@ -180,7 +240,6 @@ class WorkerService:
             range_max=task.range_max,
         )
 
-        # If aborted mid-mining, discard result
         if self._aborted.is_set():
             logger.info("Task %s aborted — discarding result", task.task_id)
             ch.basic_ack(delivery_tag=method.delivery_tag)
@@ -204,7 +263,24 @@ class WorkerService:
             logger.warning("No solution found in range [%d, %d]",
                            task.range_min, task.range_max)
 
+        self.tasks_processed += 1
         ch.basic_ack(delivery_tag=method.delivery_tag)
+
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+
+def setup_logging(log_file: str | None = None) -> None:
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+        handlers=handlers,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -213,21 +289,21 @@ class WorkerService:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    )
+    log_file = os.getenv("LOG_FILE")
+    setup_logging(log_file)
 
     worker_id = os.getenv("WORKER_ID", f"worker-{uuid.uuid4().hex[:8]}")
     rmq_url = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
     miner_binary = os.getenv("MINER_BINARY", "./md5_range")
     heartbeat = float(os.getenv("HEARTBEAT_INTERVAL", str(DEFAULT_HEARTBEAT_INTERVAL)))
+    health_port = int(os.getenv("HEALTH_PORT", str(DEFAULT_HEALTH_PORT)))
 
     worker = WorkerService(
         worker_id=worker_id,
         rmq_url=rmq_url,
         miner_binary=miner_binary,
         heartbeat_interval=heartbeat,
+        health_port=health_port,
     )
 
     def _shutdown(signum: int, frame: Any) -> None:

@@ -8,7 +8,7 @@ COPY broker/ broker/
 COPY storage/ storage/
 COPY nct/ nct/
 
-RUN pip install --no-cache-dir redis pika
+RUN pip install --no-cache-dir redis pika fastapi uvicorn
 
 ENV PYTHONPATH=/app
 

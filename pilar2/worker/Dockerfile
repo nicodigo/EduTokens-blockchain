@@ -6,7 +6,7 @@ COPY broker/ broker/
 COPY miner/ miner/
 COPY worker/ worker/
 
-RUN pip install --no-cache-dir pika
+RUN pip install --no-cache-dir pika fastapi uvicorn
 
 ENV PYTHONPATH=/app
 

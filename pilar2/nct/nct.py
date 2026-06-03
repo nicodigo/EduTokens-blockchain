@@ -18,9 +18,10 @@ import os
 import signal
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Optional
-from urllib.parse import urlparse
+
+import uvicorn
+from fastapi import FastAPI
 
 from broker.broker import (
     RESULTS_QUEUE,
@@ -33,6 +34,13 @@ from broker.broker import (
 from broker.messages import ResultMessage
 from nct.state import NCTConfig, NCTState
 from shared.block import Block, Transaction
+from shared.schemas import (
+    ErrorResponse,
+    HealthResponse,
+    NCTStatusResponse,
+    TransactionRequest,
+    TransactionResponse,
+)
 from storage.chain_store import (
     connect as redis_connect,
     get_latest_block,
@@ -263,93 +271,59 @@ def result_loop(
 
 
 # ---------------------------------------------------------------------------
-# HTTP health server
+# FastAPI health application
 # ---------------------------------------------------------------------------
 
-# Module-level refs set by main() so the handler can access them
-_health_state: Optional[NCTState] = None
-_health_redis: Any = None
+
+def create_health_app(state: NCTState) -> FastAPI:
+    """Build a FastAPI app wired to the shared NCT state.
+
+    The app is created once in ``main()`` and served by uvicorn in a
+    background thread — same threading model as before, cleaner contracts.
+    """
+    app = FastAPI(title="NCT", version="1.0.0")
+
+    @app.get("/health", response_model=HealthResponse)
+    def health() -> HealthResponse:
+        return HealthResponse(status="ok")
+
+    @app.get("/status", response_model=NCTStatusResponse)
+    def status() -> NCTStatusResponse:
+        cb, _, _ = state.get_current_for_verification()
+        return NCTStatusResponse(
+            chain_height=state.chain_height,
+            pending_transactions=state.pool_size(),
+            current_block=cb.index if cb else None,
+        )
+
+    @app.post(
+        "/transaction",
+        response_model=TransactionResponse,
+        status_code=201,
+        responses={400: {"model": ErrorResponse}},
+    )
+    def create_transaction(tx: TransactionRequest) -> TransactionResponse:
+        t = Transaction(
+            sender=tx.sender,
+            receiver=tx.receiver,
+            amount=tx.amount,
+        )
+        errors = t.validate()
+        if errors:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=400, content=ErrorResponse(error="; ".join(errors)).model_dump(),
+            )
+        state.add_transaction(t)
+        return TransactionResponse(tx_id=t.tx_id)
+
+    return app
 
 
-class HealthHandler(BaseHTTPRequestHandler):
-    """Minimal HTTP handler for health checks, status, and transaction submission."""
-
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        logger.debug(format, *args)
-
-    def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-
-        if parsed.path == "/health":
-            self._respond_json(200, {"status": "ok"})
-
-        elif parsed.path == "/status":
-            chain_height = 0
-            pending = 0
-            current_block = None
-            if _health_state is not None:
-                chain_height = _health_state.chain_height
-                pending = _health_state.pool_size()
-                cb, _, _ = _health_state.get_current_for_verification()
-                if cb is not None:
-                    current_block = cb.index
-
-            self._respond_json(200, {
-                "chain_height": chain_height,
-                "pending_transactions": pending,
-                "current_block": current_block,
-            })
-
-        else:
-            self._respond_json(404, {"error": "not found"})
-
-    def do_POST(self) -> None:
-        parsed = urlparse(self.path)
-
-        if parsed.path == "/transaction":
-            content_length = int(self.headers.get("Content-Length", 0))
-            raw = self.rfile.read(content_length)
-
-            try:
-                data = json.loads(raw)
-                tx = Transaction(
-                    sender=data["sender"],
-                    receiver=data["receiver"],
-                    amount=float(data["amount"]),
-                )
-            except (KeyError, ValueError, json.JSONDecodeError) as exc:
-                self._respond_json(400, {"error": str(exc)})
-                return
-
-            errors = tx.validate()
-            if errors:
-                self._respond_json(400, {"errors": errors})
-                return
-
-            if _health_state is not None:
-                _health_state.add_transaction(tx)
-
-            self._respond_json(201, {"tx_id": tx.tx_id})
-
-        else:
-            self._respond_json(404, {"error": "not found"})
-
-    def _respond_json(self, status: int, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload, sort_keys=True).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-
-def health_loop(port: int) -> None:
-    """Thread 3 — expose /health, /status, and POST /transaction."""
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+def health_loop(app: FastAPI, port: int) -> None:
+    """Thread 3 — serve the FastAPI app via uvicorn."""
     logger.info("Health server listening on port %d", port)
-
-    # Run in a thread — serve_forever blocks
-    server.serve_forever(poll_interval=0.5)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
 
 
 # ---------------------------------------------------------------------------
@@ -375,9 +349,14 @@ def ensure_genesis(redis_client: Any) -> None:
 
 
 def main() -> None:
+    log_file = os.getenv("LOG_FILE")
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+        handlers=handlers,
     )
 
     config = load_config()
@@ -396,10 +375,8 @@ def main() -> None:
     state = NCTState()
     state.chain_height = 1  # genesis is block 0 → height = 1
 
-    # Wire module-level refs for the health handler
-    global _health_state, _health_redis
-    _health_state = state
-    _health_redis = redis_client
+    # ---- FastAPI app (wired to shared state) ----
+    health_app = create_health_app(state)
 
     # ---- Threads ----
     threads = [
@@ -407,7 +384,7 @@ def main() -> None:
                          name="block-loop", daemon=True),
         threading.Thread(target=result_loop, args=(state, redis_client, channel),
                          name="result-loop", daemon=True),
-        threading.Thread(target=health_loop, args=(config.port,),
+        threading.Thread(target=health_loop, args=(health_app, config.port),
                          name="health-loop", daemon=True),
     ]
 
