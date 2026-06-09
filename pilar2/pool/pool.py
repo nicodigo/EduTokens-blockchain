@@ -4,6 +4,9 @@ Consumes mining tasks from the NCT, partitions the nonce space across
 its local workers, verifies their results, and forwards valid solutions
 back to the NCT.
 
+Worker count is determined dynamically from heartbeats; ``POOL_WORKER_COUNT``
+is used as a fallback when no heartbeat data is available yet.
+
 Usage::
 
     python -m pool.pool
@@ -45,6 +48,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_WORKER_COUNT = 2
 DEFAULT_NONCE_SPACE = 1_000_000_000
 DEFAULT_HEALTH_PORT = 8090
+DEFAULT_HEARTBEAT_TIMEOUT = 15.0
 
 # ---------------------------------------------------------------------------
 # PoolCoordinator
@@ -57,6 +61,11 @@ class PoolCoordinator:
     Each pool binds its own inbox queue to ``task.mining`` so every
     pool receives a copy of the NCT's broadcast.  The pool then
     partitions the nonce space among its workers.
+
+    Worker count is driven by heartbeats — the pool listens on
+    ``worker.{pool_id}.*`` and counts workers seen in the last
+    ``heartbeat_timeout`` seconds.  Falls back to ``worker_count``
+    when no heartbeat data is available (e.g. at startup).
     """
 
     def __init__(
@@ -65,10 +74,11 @@ class PoolCoordinator:
         rmq_url: str,
         worker_count: int = DEFAULT_WORKER_COUNT,
         health_port: int = DEFAULT_HEALTH_PORT,
+        heartbeat_timeout: float = DEFAULT_HEARTBEAT_TIMEOUT,
     ) -> None:
         self.pool_id = pool_id
         self.rmq_url = rmq_url
-        self._worker_count = worker_count
+        self._worker_count_fallback = worker_count
         self.health_port = health_port
 
         # Current mining context
@@ -76,6 +86,11 @@ class PoolCoordinator:
         self._current_fingerprint: str = ""
         self._current_difficulty: int = 0
         self._current_task_id: str = ""
+
+        # Worker heartbeat tracking (dynamic worker count)
+        self._heartbeat_lock = threading.Lock()
+        self._heartbeat_timeout = heartbeat_timeout
+        self._worker_heartbeats: dict[str, float] = {}
 
         self._shutdown: threading.Event = threading.Event()
         self._channel: Any = None
@@ -108,6 +123,12 @@ class PoolCoordinator:
         self._channel.queue_bind(exchange=EXCHANGE, queue=results_q,
                                  routing_key=f"pool.{self.pool_id}.result.*")
 
+        # Worker heartbeat registry — used for dynamic worker count
+        registry_q = f"pool.{self.pool_id}.registry"
+        self._channel.queue_declare(queue=registry_q, durable=True)
+        self._channel.queue_bind(exchange=EXCHANGE, queue=registry_q,
+                                 routing_key=f"worker.{self.pool_id}.*")
+
         # Health HTTP server
         threading.Thread(target=self._run_health, daemon=True, name="health").start()
 
@@ -117,9 +138,12 @@ class PoolCoordinator:
                                      auto_ack=False)
         self._channel.basic_consume(queue=results_q, on_message_callback=self._on_worker_result,
                                      auto_ack=True)
+        self._channel.basic_consume(queue=registry_q, on_message_callback=self._on_worker_heartbeat,
+                                     auto_ack=True)
 
-        logger.info("Pool %s ready (workers=%d) — health on :%d",
-                     self.pool_id, self._worker_count, self.health_port)
+        logger.info("Pool %s ready (fallback_workers=%d, heartbeat_timeout=%.0fs) — health on :%d",
+                     self.pool_id, self._worker_count_fallback,
+                     self._heartbeat_timeout, self.health_port)
         self._channel.start_consuming()
 
     def shutdown(self) -> None:
@@ -131,6 +155,28 @@ class PoolCoordinator:
                 pass
 
     # ------------------------------------------------------------------
+    # Worker heartbeat tracking
+    # ------------------------------------------------------------------
+
+    def _on_worker_heartbeat(self, _ch: Any, _method: Any, _props: Any, body: bytes) -> None:
+        data = json.loads(body.decode())
+        with self._heartbeat_lock:
+            self._worker_heartbeats[data["worker_id"]] = data.get(
+                "timestamp", time.time()
+            )
+
+    def _get_active_worker_count(self) -> int:
+        """Return number of workers that sent a heartbeat recently."""
+        cutoff = time.time() - self._heartbeat_timeout
+        with self._heartbeat_lock:
+            stale = [
+                wid for wid, ts in self._worker_heartbeats.items() if ts < cutoff
+            ]
+            for wid in stale:
+                del self._worker_heartbeats[wid]
+            return len(self._worker_heartbeats)
+
+    # ------------------------------------------------------------------
     # Mining task → partition & distribute
     # ------------------------------------------------------------------
 
@@ -139,18 +185,28 @@ class PoolCoordinator:
         logger.info("Received mining task for block %d (range=[%d, %d])",
                      task.block_index, task.range_min, task.range_max)
 
+        count = self._get_active_worker_count()
+        if count == 0:
+            # No heartbeats seen yet — fall back to static config
+            count = self._worker_count_fallback
+            if count == 0:
+                logger.warning("No active workers and fallback is 0 — skipping block %d",
+                               task.block_index)
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                return
+            logger.info("No heartbeats yet; using fallback worker_count=%d", count)
+
         self._current_block_index = task.block_index
         self._current_fingerprint = task.fingerprint
         self._current_difficulty = task.difficulty
         self._current_task_id = task.task_id
 
-        # Partition the nonce space and distribute to pool workers
         publish_tasks(
             self._channel,
             block_index=task.block_index,
             fingerprint=task.fingerprint,
             difficulty=task.difficulty,
-            num_workers=self._worker_count,
+            num_workers=count,
             range_size=task.range_max - task.range_min + 1,
         )
 
