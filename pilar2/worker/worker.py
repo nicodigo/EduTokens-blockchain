@@ -22,7 +22,6 @@ from fastapi import FastAPI
 from broker.broker import (
     CONTROL_ROUTING_KEY,
     EXCHANGE,
-    TASKS_QUEUE,
     WORKER_REGISTRY_QUEUE,
     declare_topology,
     get_connection,
@@ -121,9 +120,6 @@ class WorkerService:
 
         # Bind to task source: fanout inbox (solo) or pool queue
         if self.pool_id:
-            inbox = f"pool.{self.pool_id}.inbox"
-            from broker.broker import declare_consumer_queue
-            declare_consumer_queue(self._channel, inbox, "task.mining")
             tasks_queue = f"pool.{self.pool_id}.tasks"
             self._channel.queue_declare(queue=tasks_queue, durable=True)
             self._channel.queue_bind(exchange=EXCHANGE, queue=tasks_queue,

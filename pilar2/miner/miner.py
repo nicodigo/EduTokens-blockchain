@@ -6,6 +6,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from typing import Optional
+import shlex
 
 
 # ---------------------------------------------------------------------------
@@ -111,8 +112,7 @@ class MinerService:
         MinerError
             If the subprocess crashes, times out, or produces unparseable output.
         """
-        cmd = [
-            self.binary_path,
+        cmd = shlex.split(self.binary_path) + [
             base_string,
             target_prefix,
             str(range_min),

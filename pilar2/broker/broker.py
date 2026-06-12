@@ -99,6 +99,7 @@ def publish_tasks(
     difficulty: int,
     num_workers: int = 3,
     range_size: int = 1_000_000_000,
+    routing_key_prefix: str = "task",
 ) -> list[TaskMessage]:
     """Partition the nonce space and publish one task per partition.
 
@@ -123,7 +124,7 @@ def publish_tasks(
 
         channel.basic_publish(
             exchange=EXCHANGE,
-            routing_key=f"task.{i}",
+            routing_key=f"{routing_key_prefix}.{i}",
             body=task.to_json(),
         )
 

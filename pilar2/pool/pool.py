@@ -208,6 +208,7 @@ class PoolCoordinator:
             difficulty=task.difficulty,
             num_workers=count,
             range_size=task.range_max - task.range_min + 1,
+            routing_key_prefix=f"pool.{self.pool_id}.task",
         )
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
