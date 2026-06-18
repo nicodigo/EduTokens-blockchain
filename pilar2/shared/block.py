@@ -35,6 +35,7 @@ class Transaction:
     concept: str = ""
     signature: str = ""
     timestamp: float = field(default_factory=time.time)
+    nonce: int = 0
 
     # ------------------------------------------------------------------
     # Hashing (signature excluded — breaks circular dependency)
@@ -50,6 +51,7 @@ class Transaction:
             "tx_type": self.tx_type,
             "concept": self.concept,
             "timestamp": self.timestamp,
+            "nonce": self.nonce,
         }
 
     @property
@@ -71,6 +73,7 @@ class Transaction:
         """Full serialisation, **including** the signature (for storage)."""
         d = self._signing_dict()
         d["signature"] = self.signature
+        d["nonce"] = self.nonce
         return d
 
     @classmethod
@@ -83,6 +86,7 @@ class Transaction:
             concept=data.get("concept", ""),
             signature=data.get("signature", ""),
             timestamp=data["timestamp"],
+            nonce=data.get("nonce", 0),
         )
 
     # ------------------------------------------------------------------

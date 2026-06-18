@@ -35,6 +35,7 @@ from broker.messages import ResultMessage
 from nct.state import NCTConfig, NCTState
 from shared.block import Block, Transaction
 from shared.schemas import (
+    AccountResponse,
     BalanceResponse,
     ErrorResponse,
     HealthResponse,
@@ -44,14 +45,17 @@ from shared.schemas import (
 )
 from storage.chain_store import (
     BALANCE_PREFIX,
+    NONCE_PREFIX,
     connect as redis_connect,
     get_balance,
     get_block,
     get_chain_height,
     get_latest_block,
+    get_nonce,
     rebuild_balances_from_chain,
     save_block,
     update_balances_from_block,
+    update_nonces_from_block,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,10 +124,27 @@ def drain_pool_validated(
     """
     candidates = state.drain_pool(max_count)
     overlay: dict[str, float] = {}   # student_id → accumulated delta in this block
+    nonce_overlay: dict[str, int] = {}  # sender_pubkey → next expected nonce in this block
     valid: list[Transaction] = []
     discarded: list[Transaction] = []
 
     for tx in candidates:
+        # Nonce validation — reject if nonce was already consumed
+        # (e.g. another transaction from same sender mined between POST and now,
+        #  or another tx from the same sender already accepted in this block)
+        current_nonce = get_nonce(redis_client, tx.sender_pubkey)
+        expected = nonce_overlay.get(tx.sender_pubkey, current_nonce)
+        if tx.nonce != expected:
+            discarded.append(tx)
+            logger.warning(
+                "TX descartada — nonce inválido: sender=%s esperado=%d recibido=%d",
+                tx.sender_pubkey, expected, tx.nonce,
+            )
+            continue
+
+        # Advance nonce for this sender within the block
+        nonce_overlay[tx.sender_pubkey] = tx.nonce + 1
+
         if tx.tx_type == "EARN":
             valid.append(tx)
             overlay[tx.receiver_pubkey] = overlay.get(tx.receiver_pubkey, 0.0) + tx.amount
@@ -193,6 +214,7 @@ def handle_result(
     # ---- Persist ----
     save_block(redis_client, current_block)
     update_balances_from_block(redis_client, current_block)
+    update_nonces_from_block(redis_client, current_block)
     state.chain_height = current_block.index + 1
 
     # ---- Broadcast abort / signal block loop ----
@@ -377,6 +399,7 @@ def create_health_app(state: NCTState, redis_client: Any) -> FastAPI:
             tx_type=tx.tx_type,
             concept=tx.concept,
             signature=tx.signature,
+            nonce=tx.nonce,
         )
 
         # 1. Structural validation (pubkey lengths, amount, concept, etc.)
@@ -396,7 +419,17 @@ def create_health_app(state: NCTState, redis_client: Any) -> FastAPI:
                 ).model_dump(),
             )
 
-        # 3. Authority check — only the configured authority can issue EARN
+        # 3. Nonce validation — prevents replay attacks
+        current_nonce = get_nonce(redis_client, t.sender_pubkey)
+        if t.nonce != current_nonce:
+            return JSONResponse(
+                status_code=400,
+                content=ErrorResponse(
+                    error=f"invalid nonce: expected {current_nonce}, got {t.nonce}"
+                ).model_dump(),
+            )
+
+        # 4. Authority check — only the configured authority can issue EARN
         if t.tx_type == "EARN":
             if not config.authority_pubkey:
                 return JSONResponse(
@@ -420,6 +453,13 @@ def create_health_app(state: NCTState, redis_client: Any) -> FastAPI:
     def get_balance_for_address(address: str) -> BalanceResponse:
         balance = get_balance(redis_client, address)
         return BalanceResponse(address=address, balance=balance)
+
+    @app.get("/account/{pubkey}", response_model=AccountResponse)
+    def get_account(pubkey: str) -> AccountResponse:
+        """Return balance and next expected nonce for a public key."""
+        balance = get_balance(redis_client, pubkey)
+        nonce = get_nonce(redis_client, pubkey)
+        return AccountResponse(address=pubkey, balance=balance, nonce=nonce)
 
     @app.get("/chain", response_model=list[dict])
     def get_chain() -> list[dict]:
@@ -460,11 +500,12 @@ def ensure_genesis(redis_client: Any) -> None:
         logger.info("Genesis block created (hash=%s)", genesis.hash)
         return
 
-    # Recovery: chain exists but balance index is empty
+    # Recovery: chain exists but balance/nonce indexes are empty
     if get_chain_height(redis_client) > 0:
         balance_keys = redis_client.keys(f"{BALANCE_PREFIX}*")
-        if not balance_keys:
-            logger.warning("Índice de saldos vacío con cadena existente — reconstruyendo")
+        nonce_keys = redis_client.keys(f"{NONCE_PREFIX}*")
+        if not balance_keys or not nonce_keys:
+            logger.warning("Índices de estado vacíos con cadena existente — reconstruyendo")
             rebuild_balances_from_chain(redis_client)
 
 

@@ -28,6 +28,12 @@ class BalanceResponse(BaseModel):
     balance: float
 
 
+class AccountResponse(BaseModel):
+    address: str = Field(..., description="Public-key derived address (24 hex chars)")
+    balance: float
+    nonce: int = Field(..., ge=0, description="Next expected nonce for this account")
+
+
 # ---------------------------------------------------------------------------
 # NCT
 # ---------------------------------------------------------------------------
@@ -65,6 +71,7 @@ class TransactionRequest(BaseModel):
         pattern=_SIG_HEX_RE,
         description="Ed25519 signature over tx_id (128 hex chars)",
     )
+    nonce: int = Field(..., ge=0, description="Sequential nonce for replay protection")
 
 
 class TransactionResponse(BaseModel):

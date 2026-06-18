@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 from broker.messages import ResultMessage
 from nct.nct import (
     accumulate_transactions,
+    drain_pool_validated,
     handle_result,
     verify_pow_result,
 )
@@ -19,26 +20,30 @@ from tests._crypto_fixtures import make_keypair, sign
 # ---------------------------------------------------------------------------
 
 def _make_earn_tx(receiver_pub: str, authority_priv: str, authority_pub: str,
-                  amount: float = 1.0, concept: str = "TP1") -> Transaction:
+                  amount: float = 1.0, concept: str = "TP1",
+                  nonce: int = 0) -> Transaction:
     tx = Transaction(
         sender_pubkey=authority_pub,
         receiver_pubkey=receiver_pub,
         amount=amount,
         tx_type="EARN",
         concept=concept,
+        nonce=nonce,
     )
     tx.signature = sign(authority_priv, tx.tx_id.encode())
     return tx
 
 
 def _make_spend_tx(sender_priv: str, sender_pub: str, vendor_pub: str,
-                   amount: float = 1.0, concept: str = "COMEDOR") -> Transaction:
+                   amount: float = 1.0, concept: str = "COMEDOR",
+                   nonce: int = 0) -> Transaction:
     tx = Transaction(
         sender_pubkey=sender_pub,
         receiver_pubkey=vendor_pub,
         amount=amount,
         tx_type="SPEND",
         concept=concept,
+        nonce=nonce,
     )
     tx.signature = sign(sender_priv, tx.tx_id.encode())
     return tx
@@ -88,11 +93,13 @@ class TestAccumulateTransactions(unittest.TestCase):
         state = NCTState()
         config = NCTConfig(block_size=2, block_timeout=60)
         state.add_transaction(_make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub,
-                                            amount=1.0))
+                                            amount=1.0, nonce=0))
         state.add_transaction(_make_earn_tx(self.vendor_pub, self.uni_priv, self.uni_pub,
-                                            amount=2.0))
+                                            amount=2.0, nonce=1))
 
         redis_mock = MagicMock()
+        # get_nonce calls redis_client.get("nonce:...") — return None for missing keys
+        redis_mock.get.return_value = None
         txs = accumulate_transactions(state, redis_mock, config)
         self.assertEqual(len(txs), 2)
         self.assertEqual(state.pool_size(), 0)
@@ -187,6 +194,111 @@ class TestHandleResult(unittest.TestCase):
         ok = handle_result(self.state, self.redis, self.channel, result)
         self.assertFalse(ok)
         self.assertFalse(self.state.block_mined.is_set())
+
+
+# ---------------------------------------------------------------------------
+# Nonce validation (anti-replay)
+# ---------------------------------------------------------------------------
+
+
+class TestNonceValidation(unittest.TestCase):
+    def setUp(self):
+        self.student_priv, self.student_pub, _ = make_keypair()
+        self.uni_priv, self.uni_pub, _ = make_keypair()
+        self.vendor_priv, self.vendor_pub, _ = make_keypair()
+
+    def test_drain_pool_rejects_stale_nonce(self):
+        """Transactions with nonce < current are discarded (replay)."""
+        state = NCTState()
+        redis_mock = MagicMock()
+
+        # Simulate current nonce = 3 for this sender
+        redis_mock.get.return_value = "3"
+
+        tx = _make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub)
+        tx.nonce = 2  # stale — already consumed nonce
+        tx.signature = sign(self.uni_priv, tx.tx_id.encode())
+        state.add_transaction(tx)
+
+        result = drain_pool_validated(state, redis_mock, 5)
+        self.assertEqual(result, [], "stale nonce should be rejected")
+
+    def test_drain_pool_accepts_correct_nonce(self):
+        """Transactions with nonce == current are accepted."""
+        state = NCTState()
+        redis_mock = MagicMock()
+
+        # get_nonce uses redis_client.get(), which returns a string
+        redis_mock.get.return_value = "3"
+
+        tx = _make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub)
+        tx.nonce = 3  # correct — matches expected nonce
+        tx.signature = sign(self.uni_priv, tx.tx_id.encode())
+        state.add_transaction(tx)
+
+        result = drain_pool_validated(state, redis_mock, 5)
+        self.assertEqual(len(result), 1)
+
+    def test_drain_pool_accepts_default_nonce_zero(self):
+        """New account with no nonce record has expected nonce = 0."""
+        state = NCTState()
+        redis_mock = MagicMock()
+
+        # No nonce key set → get_nonce returns 0
+        redis_mock.get.return_value = None
+
+        tx = _make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub)
+        tx.nonce = 0  # first transaction from this sender
+        tx.signature = sign(self.uni_priv, tx.tx_id.encode())
+        state.add_transaction(tx)
+
+        result = drain_pool_validated(state, redis_mock, 5)
+        self.assertEqual(len(result), 1)
+
+    def test_handle_result_updates_nonces(self):
+        """After a block is mined, sender nonces are incremented."""
+        import hashlib
+
+        state = NCTState()
+        redis_mock = MagicMock()
+        channel_mock = MagicMock()
+
+        block = Block(
+            index=1,
+            timestamp=2.0,
+            transactions=[],
+            previous_hash=Block.create_genesis().hash,
+            difficulty=4,
+        )
+        # Create tx with nonce=3
+        tx = _make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub)
+        tx.nonce = 3
+        tx.signature = sign(self.uni_priv, tx.tx_id.encode())
+        block.transactions = [tx]
+
+        state.set_current_block(block, 1_000_000)
+
+        # Find valid PoW
+        fingerprint = block.fingerprint
+        nonce = 0
+        while nonce < 10_000_000:
+            claimed = hashlib.md5((fingerprint + str(nonce)).encode()).hexdigest()
+            if claimed.startswith("0000"):
+                break
+            nonce += 1
+
+        result = ResultMessage(
+            task_id="t1", block_index=1, worker_id="w1", nonce=nonce, hash=claimed,
+        )
+
+        ok = handle_result(state, redis_mock, channel_mock, result)
+        self.assertTrue(ok)
+
+        # Verify that update_nonces_from_block was called
+        # redis_mock.set should have been called for nonce increment
+        # (through the pipeline)
+        self.assertTrue(redis_mock.pipeline.called,
+                        "pipeline should be called to update nonces")
 
 
 class TestNCTState(unittest.TestCase):

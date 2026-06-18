@@ -33,6 +33,7 @@ from shared.block import Block
 
 BLOCKS_KEY = "blockchain:blocks"
 BALANCE_PREFIX = "balance:"
+NONCE_PREFIX = "nonce:"
 
 # ---------------------------------------------------------------------------
 # Connection
@@ -143,6 +144,35 @@ def get_balance(client: Any, address: str) -> float:
     return float(val) if val is not None else 0.0
 
 
+# ---------------------------------------------------------------------------
+# Nonce index (per-account sequential counter for replay protection)
+# ---------------------------------------------------------------------------
+
+
+def get_nonce(client: Any, pubkey: str) -> int:
+    """Return the next expected nonce for *pubkey*, or ``0`` if no entry exists."""
+    val = client.get(f"{NONCE_PREFIX}{pubkey}")
+    return int(val) if val is not None else 0
+
+
+def _set_nonce(client: Any, pubkey: str, nonce: int) -> None:
+    """Set the nonce for *pubkey* (used during rebuild)."""
+    client.set(f"{NONCE_PREFIX}{pubkey}", nonce)
+
+
+def update_nonces_from_block(client: Any, block: Block) -> None:
+    """Increment the nonce for every sender in *block*.
+
+    Called immediately after :func:`update_balances_from_block`.
+    Each sender's nonce is set to ``tx.nonce + 1``, ensuring the next
+    transaction from that sender must use a strictly greater nonce.
+    """
+    pipe = client.pipeline()
+    for tx in block.transactions:
+        pipe.set(f"{NONCE_PREFIX}{tx.sender_pubkey}", tx.nonce + 1)
+    pipe.execute()
+
+
 def update_balances_from_block(client: Any, block: Block) -> None:
     """Atomically update the balance index for every transaction in *block*.
 
@@ -164,8 +194,8 @@ def update_balances_from_block(client: Any, block: Block) -> None:
     pipe.execute()
 
 
-def rebuild_balances_from_chain(client: Any) -> None:
-    """Walk the full chain and recompute every student balance from scratch.
+def rebuild_state_from_chain(client: Any) -> None:
+    """Walk the full chain and recompute balances and nonces from scratch.
 
     Call at startup when the chain is non-empty but the balance index is
     missing (e.g. after a crash between ``save_block`` and
@@ -175,7 +205,7 @@ def rebuild_balances_from_chain(client: Any) -> None:
     logger = logging.getLogger(__name__)
 
     height = get_chain_height(client)
-    logger.info("Rebuilding balance index from %d block(s)…", height)
+    logger.info("Rebuilding state from %d block(s)…", height)
 
     for i in range(height):
         block = get_block(client, i)
@@ -186,5 +216,11 @@ def rebuild_balances_from_chain(client: Any) -> None:
                 client.incrbyfloat(f"{BALANCE_PREFIX}{tx.receiver_pubkey}", tx.amount)
             elif tx.tx_type == "SPEND":
                 client.incrbyfloat(f"{BALANCE_PREFIX}{tx.sender_pubkey}", -tx.amount)
+            # Nonce: set to tx.nonce + 1 (last writer wins per sender)
+            _set_nonce(client, tx.sender_pubkey, tx.nonce + 1)
 
-    logger.info("Balance index rebuilt")
+    logger.info("State rebuilt")
+
+
+# Backward-compatible alias
+rebuild_balances_from_chain = rebuild_state_from_chain

@@ -200,6 +200,50 @@ class TestTransaction(unittest.TestCase):
         tx.concept = "FRAUDE"
         self.assertFalse(crypto_verify(tx.sender_pubkey, tx.tx_id.encode(), tx.signature))
 
+    # -- Nonce ---------------------------------------------------------------
+
+    def test_nonce_affects_tx_id(self):
+        """Two identical transactions with different nonces have different tx_ids."""
+        tx1 = Transaction(
+            sender_pubkey=self.uni_pub,
+            receiver_pubkey=self.student_pub,
+            amount=10.0,
+            tx_type="EARN",
+            concept="TP1",
+            timestamp=1000.0,
+            nonce=0,
+        )
+        tx2 = Transaction(
+            sender_pubkey=self.uni_pub,
+            receiver_pubkey=self.student_pub,
+            amount=10.0,
+            tx_type="EARN",
+            concept="TP1",
+            timestamp=1000.0,
+            nonce=1,
+        )
+        self.assertNotEqual(tx1.tx_id, tx2.tx_id)
+
+    def test_nonce_survives_roundtrip(self):
+        """Nonce is preserved through serialisation/deserialisation."""
+        tx = _make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub)
+        tx.nonce = 5
+        tx.signature = sign(self.uni_priv, tx.tx_id.encode())
+        restored = Transaction.from_dict(tx.to_dict())
+        self.assertEqual(restored.nonce, 5)
+
+    def test_nonce_is_in_signing_dict(self):
+        """Tampering with the nonce invalidates the signature."""
+        from shared.crypto import verify as crypto_verify
+        tx = _make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub)
+        tx.nonce = 0
+        tx.signature = sign(self.uni_priv, tx.tx_id.encode())
+        self.assertTrue(crypto_verify(tx.sender_pubkey, tx.tx_id.encode(), tx.signature))
+
+        # Tamper with nonce
+        tx.nonce = 99
+        self.assertFalse(crypto_verify(tx.sender_pubkey, tx.tx_id.encode(), tx.signature))
+
 
 # ---------------------------------------------------------------------------
 # Block

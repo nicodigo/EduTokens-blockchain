@@ -83,6 +83,7 @@ and types MUST be exactly these):
 |---|---|---|---|
 | `amount` | number (float) | `10.0` | Must be > 0 |
 | `concept` | string | `"TP1"` | 1–128 chars, non-empty |
+| `nonce` | number (int) | `0` | Sequential counter for replay protection (see §4.3) |
 | `receiver_pubkey` | string | `"a1b2c3..."` | 64 hex chars |
 | `sender_pubkey` | string | `"d4e5f6..."` | 64 hex chars |
 | `timestamp` | number (float) | `1718697600.123` | Unix seconds (UTC) |
@@ -95,7 +96,7 @@ with `sort_keys` so the JSON is deterministic across platforms.
 
 ```js
 function computeTxId(txBody) {
-  // txBody is { sender_pubkey, receiver_pubkey, amount, tx_type, concept, timestamp }
+  // txBody is { sender_pubkey, receiver_pubkey, amount, tx_type, concept, timestamp, nonce }
   // signature is NOT in txBody
   const json = JSON.stringify(txBody, Object.keys(txBody).sort());
   const hash = // SHA-256 of new TextEncoder().encode(json)
@@ -144,15 +145,16 @@ Both sides MUST match.
 ```js
 async function createSignedTransaction(senderPrivKey, senderPubKey,
                                         receiverPubKey, amount,
-                                        txType, concept) {
+                                        txType, concept, nonce) {
   // 1. Build signing body (NO signature)
   const body = {
     amount: amount,
     concept: concept,
-    receiver_pubkey: receiverPubKey,       // 64 hex
-    sender_pubkey: senderPubKey,           // 64 hex
-    timestamp: Date.now() / 1000,          // seconds, float
-    tx_type: txType,                       // "EARN" or "SPEND"
+    nonce: nonce,                           // sequential counter (see §4.3)
+    receiver_pubkey: receiverPubKey,        // 64 hex
+    sender_pubkey: senderPubKey,            // 64 hex
+    timestamp: Date.now() / 1000,           // seconds, float
+    tx_type: txType,                        // "EARN" or "SPEND"
   };
 
   // 2. Compute tx_id
@@ -197,6 +199,7 @@ Content-Type: application/json
   "amount": 10.0,
   "tx_type": "EARN",
   "concept": "TP1",
+  "nonce": 3,
   "timestamp": 1718697600.123,
   "signature": "a1b2c3d4... (128 hex chars total)"
 }
@@ -211,6 +214,7 @@ Content-Type: application/json
 | `amount` | `> 0`, float |
 | `tx_type` | `"EARN"` or `"SPEND"` |
 | `concept` | 1–128 chars, non-empty |
+| `nonce` | Integer `>= 0`, must match the next expected nonce for this sender |
 | `timestamp` | Unix float (seconds) |
 | `signature` | Exactly 128 lowercase hex chars `[0-9a-f]` |
 
@@ -238,6 +242,7 @@ Possible error messages emitted by the server:
 - `"sender_pubkey must be 64 hex chars, got N"`
 - `"signature must be 128 hex chars, got N"`
 - `"invalid signature — does not match sender_pubkey"`
+- `"invalid nonce: expected N, got M"` ← NEW (replay protection, see §4.3)
 - `"EARN sender_pubkey does not match AUTHORITY_PUBKEY"`
 - `"EARN transactions require AUTHORITY_PUBKEY to be configured"`
 - `"concept must not be empty"`
@@ -272,9 +277,53 @@ transactions.**
 address is a "burn address" from which nobody can spend (the private key
 is discarded or never generated).  This is valid blockchain behaviour.
 
+### 4.3 — Nonce (replay protection) ← NEW
+
+Every account has a **sequential nonce counter** that prevents replay
+attacks.  The nonce works as follows:
+
+1. **Query before signing.**  Call `GET /account/{pubkey}` to get the
+   current `nonce` for the sender.  The response includes both `balance`
+   and `nonce`.
+
+2. **Include in the signing body.**  The `nonce` field is part of
+   `txBody` and therefore part of `tx_id` and covered by the Ed25519
+   signature.  You cannot change the nonce without invalidating the
+   signature.
+
+3. **Send with the transaction.**  Include `nonce` in the JSON body of
+   `POST /transaction`.
+
+4. **Server rejects replays.**  If a transaction is re-submitted after
+   being mined, the server will see `tx.nonce < expected_nonce` and
+   return `400` with `"invalid nonce: expected N, got M"`.
+
+5. **Sequential within an account.**  Nonces are per-account (per
+   `sender_pubkey`).  The university and each student have independent
+   nonce counters starting at 0.
+
+```
+Example flow:
+  GET /account/{student_pubkey}
+  → { "balance": 50.0, "nonce": 3 }
+
+  Build txBody with nonce=3, sign, POST /transaction
+  → 201 { "tx_id": "abc..." }
+
+  Next tx from this student must use nonce=4.
+```
+
+**What if a transaction is rejected for insufficient balance?**  The
+nonce is **not** consumed.  You can retry with the same nonce.  The
+nonce only advances when a transaction is successfully mined in a block.
+
+**What if the server rejects with "invalid nonce"?**  Your nonce is
+stale.  Re-query `GET /account/{pubkey}`, get the new `nonce`, and
+re-sign with the correct value.
+
 ---
 
-## 5. Check balance
+## 5. Check balance and account state
 
 ```
 GET http://localhost:8080/balance/{address_or_pubkey}
@@ -292,6 +341,30 @@ Response:
   "balance": 42.5
 }
 ```
+
+### Get account state (balance + nonce) ← NEW
+
+```
+GET http://localhost:8080/account/{pubkey}
+```
+
+Returns both balance and the next expected nonce for this account.
+Call this **before signing** any transaction.
+
+Response:
+
+```json
+{
+  "address": "b3a7f19c8d... (full pubkey, 64 hex chars)",
+  "balance": 42.5,
+  "nonce": 3
+}
+```
+
+Fields:
+- `address`: the public key (64 hex chars).
+- `balance`: confirmed balance (float).
+- `nonce`: next expected nonce for this sender (integer ≥ 0).
 
 ---
 
@@ -320,9 +393,10 @@ tx = Transaction(
     tx_type=body["tx_type"],
     concept=body["concept"],
     signature=body["signature"],
+    nonce=body["nonce"],
 )
 
-# 2. Compute tx_id from _signing_dict (EXCLUDES signature)
+# 2. Compute tx_id from _signing_dict (EXCLUDES signature, INCLUDES nonce)
 tx_id_hex = tx.tx_id  # SHA-256(json.dumps(_signing_dict(), sort_keys=True))
 
 # 3. Verify Ed25519 signature
@@ -331,7 +405,12 @@ pubkey = Ed25519PublicKey.from_public_bytes(bytes.fromhex(tx.sender_pubkey))
 sig = bytes.fromhex(tx.signature)
 pubkey.verify(sig, tx_id_hex.encode())  # encode() → UTF-8 bytes
 
-# 4. For EARN: check that sender_pubkey == AUTHORITY_PUBKEY
+# 4. Verify nonce (replay protection)
+current_nonce = redis.get(f"nonce:{tx.sender_pubkey}")  # None → 0
+if tx.nonce != int(current_nonce or 0):
+    raise ValueError(f"invalid nonce: expected {current_nonce}, got {tx.nonce}")
+
+# 5. For EARN: check that sender_pubkey == AUTHORITY_PUBKEY
 ```
 
 ---
@@ -344,7 +423,9 @@ pubkey.verify(sig, tx_id_hex.encode())  # encode() → UTF-8 bytes
   build `sender_pubkey` for EARN transactions).
 - [ ] Obtain each vendor's **public key** from the address registry
   (needed for `receiver_pubkey` in SPEND transactions).
-- [ ] Implement `computeTxId()` with snake_case sorted keys.
+- [ ] Implement `computeTxId()` with snake_case sorted keys (include `nonce`).
 - [ ] Implement `signTxId()` signing `tx_id.encode()` → 128 hex chars.
+- [ ] **Before signing:** call `GET /account/{pubkey}` to get the current `nonce`.
+- [ ] Include `nonce` in the transaction body and wire payload.
 - [ ] POST to `/transaction` with lowercase hex only.
-- [ ] Handle 201 (success) and 400 (error with message).
+- [ ] Handle 201 (success) and 400 (error with message, including nonce errors).
