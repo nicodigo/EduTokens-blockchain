@@ -78,6 +78,7 @@ def load_config() -> NCTConfig:
         difficulty=_env_int("DIFFICULTY", 4),
         nonce_space=_env_int("NONCE_SPACE", 1_000_000_000),
         port=_env_int("PORT", 8080),
+        authority_pubkey=os.getenv("AUTHORITY_PUBKEY", ""),
     )
 
 
@@ -125,22 +126,22 @@ def drain_pool_validated(
     for tx in candidates:
         if tx.tx_type == "EARN":
             valid.append(tx)
-            overlay[tx.receiver] = overlay.get(tx.receiver, 0.0) + tx.amount
+            overlay[tx.receiver_pubkey] = overlay.get(tx.receiver_pubkey, 0.0) + tx.amount
 
         elif tx.tx_type == "SPEND":
-            confirmed = get_balance(redis_client, tx.sender)
-            in_flight = overlay.get(tx.sender, 0.0)
+            confirmed = get_balance(redis_client, tx.sender_pubkey)
+            in_flight = overlay.get(tx.sender_pubkey, 0.0)
             effective = confirmed + in_flight
 
             if effective >= tx.amount:
                 valid.append(tx)
-                overlay[tx.sender] = in_flight - tx.amount
+                overlay[tx.sender_pubkey] = in_flight - tx.amount
             else:
                 discarded.append(tx)
                 logger.warning(
-                    "SPEND descartado — saldo insuficiente: student=%s "
+                    "SPEND descartado — saldo insuficiente: sender=%s "
                     "confirmado=%.2f en_vuelo=%.2f requerido=%.2f concept=%s",
-                    tx.sender, confirmed, in_flight, tx.amount, tx.concept,
+                    tx.sender_pubkey, confirmed, in_flight, tx.amount, tx.concept,
                 )
 
     if discarded:
@@ -366,26 +367,59 @@ def create_health_app(state: NCTState, redis_client: Any) -> FastAPI:
         responses={400: {"model": ErrorResponse}},
     )
     def create_transaction(tx: TransactionRequest) -> TransactionResponse:
+        from fastapi.responses import JSONResponse
+        from shared.crypto import verify as crypto_verify
+
         t = Transaction(
-            sender=tx.sender,
-            receiver=tx.receiver,
+            sender_pubkey=tx.sender_pubkey,
+            receiver_pubkey=tx.receiver_pubkey,
             amount=tx.amount,
             tx_type=tx.tx_type,
             concept=tx.concept,
+            signature=tx.signature,
         )
+
+        # 1. Structural validation (pubkey lengths, amount, concept, etc.)
         errors = t.validate()
         if errors:
-            from fastapi.responses import JSONResponse
             return JSONResponse(
-                status_code=400, content=ErrorResponse(error="; ".join(errors)).model_dump(),
+                status_code=400,
+                content=ErrorResponse(error="; ".join(errors)).model_dump(),
             )
+
+        # 2. Signature verification (Ed25519 over tx_id)
+        if not crypto_verify(t.sender_pubkey, t.tx_id.encode(), t.signature):
+            return JSONResponse(
+                status_code=400,
+                content=ErrorResponse(
+                    error="invalid signature — does not match sender_pubkey"
+                ).model_dump(),
+            )
+
+        # 3. Authority check — only the configured authority can issue EARN
+        if t.tx_type == "EARN":
+            if not config.authority_pubkey:
+                return JSONResponse(
+                    status_code=400,
+                    content=ErrorResponse(
+                        error="EARN transactions require AUTHORITY_PUBKEY to be configured"
+                    ).model_dump(),
+                )
+            if t.sender_pubkey != config.authority_pubkey:
+                return JSONResponse(
+                    status_code=400,
+                    content=ErrorResponse(
+                        error="EARN sender_pubkey does not match AUTHORITY_PUBKEY"
+                    ).model_dump(),
+                )
+
         state.add_transaction(t)
         return TransactionResponse(tx_id=t.tx_id)
 
-    @app.get("/balance/{student_id}", response_model=BalanceResponse)
-    def get_student_balance(student_id: str) -> BalanceResponse:
-        balance = get_balance(redis_client, f"student:{student_id}")
-        return BalanceResponse(student_id=student_id, balance=balance)
+    @app.get("/balance/{address}", response_model=BalanceResponse)
+    def get_balance_for_address(address: str) -> BalanceResponse:
+        balance = get_balance(redis_client, address)
+        return BalanceResponse(address=address, balance=balance)
 
     @app.get("/chain", response_model=list[dict])
     def get_chain() -> list[dict]:

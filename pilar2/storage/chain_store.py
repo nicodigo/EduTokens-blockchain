@@ -134,13 +134,12 @@ def validate_chain(client: Any) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def get_balance(client: Any, student_id: str) -> float:
-    """Return the confirmed balance of *student_id*, or ``0.0`` if no entry exists.
+def get_balance(client: Any, address: str) -> float:
+    """Return the confirmed balance for *address*, or ``0.0`` if no entry exists.
 
-    The *student_id* must include the ``student:`` prefix
-    (e.g. ``"student:42"``).
+    *address* is the public key (64 hex chars) of the account holder.
     """
-    val = client.get(f"{BALANCE_PREFIX}{student_id}")
+    val = client.get(f"{BALANCE_PREFIX}{address}")
     return float(val) if val is not None else 0.0
 
 
@@ -159,9 +158,9 @@ def update_balances_from_block(client: Any, block: Block) -> None:
     pipe = client.pipeline()
     for tx in block.transactions:
         if tx.tx_type == "EARN":
-            pipe.incrbyfloat(f"{BALANCE_PREFIX}{tx.receiver}", tx.amount)
+            pipe.incrbyfloat(f"{BALANCE_PREFIX}{tx.receiver_pubkey}", tx.amount)
         elif tx.tx_type == "SPEND":
-            pipe.incrbyfloat(f"{BALANCE_PREFIX}{tx.sender}", -tx.amount)
+            pipe.incrbyfloat(f"{BALANCE_PREFIX}{tx.sender_pubkey}", -tx.amount)
     pipe.execute()
 
 
@@ -184,8 +183,8 @@ def rebuild_balances_from_chain(client: Any) -> None:
             continue
         for tx in block.transactions:
             if tx.tx_type == "EARN":
-                client.incrbyfloat(f"{BALANCE_PREFIX}{tx.receiver}", tx.amount)
+                client.incrbyfloat(f"{BALANCE_PREFIX}{tx.receiver_pubkey}", tx.amount)
             elif tx.tx_type == "SPEND":
-                client.incrbyfloat(f"{BALANCE_PREFIX}{tx.sender}", -tx.amount)
+                client.incrbyfloat(f"{BALANCE_PREFIX}{tx.sender_pubkey}", -tx.amount)
 
     logger.info("Balance index rebuilt")

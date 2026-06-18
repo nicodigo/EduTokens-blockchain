@@ -43,6 +43,7 @@ services:
       - NONCE_SPACE=1000000000
       - PORT=8080
       - LOG_FILE=/var/log/nct.log
+      - AUTHORITY_PUBKEY=
 
   pool-a:
     build:

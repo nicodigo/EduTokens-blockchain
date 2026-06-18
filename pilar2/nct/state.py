@@ -22,6 +22,7 @@ class NCTConfig:
     difficulty: int = 4
     nonce_space: int = 1_000_000_000
     port: int = 8080
+    authority_pubkey: str = ""
     heartbeat_timeout: float = 15.0
     heartbeat_interval: float = 5.0
 

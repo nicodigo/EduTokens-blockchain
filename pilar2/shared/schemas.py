@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from shared.crypto import ED25519_PUBKEY_HEX_LEN, ED25519_SIG_HEX_LEN
+
 
 # ---------------------------------------------------------------------------
 # Generic
@@ -22,7 +24,7 @@ class ErrorResponse(BaseModel):
 
 
 class BalanceResponse(BaseModel):
-    student_id: str
+    address: str = Field(..., description="Public-key derived address (24 hex chars)")
     balance: float
 
 
@@ -30,13 +32,39 @@ class BalanceResponse(BaseModel):
 # NCT
 # ---------------------------------------------------------------------------
 
+_PUBKEY_HEX_RE = rf"^[0-9a-f]{{{ED25519_PUBKEY_HEX_LEN}}}$"
+_SIG_HEX_RE = rf"^[0-9a-f]{{{ED25519_SIG_HEX_LEN}}}$"
+
 
 class TransactionRequest(BaseModel):
-    sender: str = Field(..., min_length=1, description="User sending funds")
-    receiver: str = Field(..., min_length=1, description="User receiving funds")
+    sender_pubkey: str = Field(
+        ...,
+        min_length=ED25519_PUBKEY_HEX_LEN,
+        max_length=ED25519_PUBKEY_HEX_LEN,
+        pattern=_PUBKEY_HEX_RE,
+        description="Ed25519 public key of the sender (64 hex chars)",
+    )
+    receiver_pubkey: str = Field(
+        ...,
+        min_length=ED25519_PUBKEY_HEX_LEN,
+        max_length=ED25519_PUBKEY_HEX_LEN,
+        pattern=_PUBKEY_HEX_RE,
+        description="Ed25519 public key of the receiver (64 hex chars)",
+    )
     amount: float = Field(..., gt=0, description="Amount to transfer")
-    tx_type: str = Field(..., pattern=r"^(EARN|SPEND)$", description="Transaction type: EARN or SPEND")
-    concept: str = Field(..., min_length=1, max_length=128, description="Free-text concept (e.g. TP1, FOTOCOPIADORA)")
+    tx_type: str = Field(
+        ..., pattern=r"^(EARN|SPEND)$", description="Transaction type: EARN or SPEND"
+    )
+    concept: str = Field(
+        ..., min_length=1, max_length=128, description="Free-text concept (e.g. TP1, COMEDOR)"
+    )
+    signature: str = Field(
+        ...,
+        min_length=ED25519_SIG_HEX_LEN,
+        max_length=ED25519_SIG_HEX_LEN,
+        pattern=_SIG_HEX_RE,
+        description="Ed25519 signature over tx_id (128 hex chars)",
+    )
 
 
 class TransactionResponse(BaseModel):

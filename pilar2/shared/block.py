@@ -18,27 +18,49 @@ class Transaction:
     """A transfer of value from one user to another.
 
     Fields:
-        sender:     User sending funds.
-        receiver:   User receiving funds.
-        amount:     Amount being transferred. Must be positive.
-        timestamp:  Unix timestamp (UTC) of when this transaction was created.
+        sender_pubkey:    Ed25519 public key (64 hex chars) of the sender.
+        receiver_pubkey:  Ed25519 public key (64 hex chars) of the receiver.
+        amount:           Amount being transferred. Must be positive.
+        tx_type:          ``"EARN"`` (university → student) or ``"SPEND"``
+                          (student → vendor).
+        concept:          Free-text description (e.g. ``"TP1"``, ``"COMEDOR"``).
+        signature:        Ed25519 signature (128 hex chars) over ``tx_id``.
+        timestamp:        Unix timestamp (UTC) of creation.
     """
 
-    sender: str
-    receiver: str
+    sender_pubkey: str
+    receiver_pubkey: str
     amount: float
     tx_type: str = ""
     concept: str = ""
+    signature: str = ""
     timestamp: float = field(default_factory=time.time)
 
     # ------------------------------------------------------------------
-    # Derived
+    # Hashing (signature excluded — breaks circular dependency)
     # ------------------------------------------------------------------
+
+    def _signing_dict(self) -> dict[str, Any]:
+        """Fields that are signed.  ``signature`` is excluded so that
+        ``tx_id = SHA-256(signing_dict)`` is computable *before* signing."""
+        return {
+            "sender_pubkey": self.sender_pubkey,
+            "receiver_pubkey": self.receiver_pubkey,
+            "amount": self.amount,
+            "tx_type": self.tx_type,
+            "concept": self.concept,
+            "timestamp": self.timestamp,
+        }
 
     @property
     def tx_id(self) -> str:
-        """SHA-256 content identifier, deterministic across instances."""
-        raw = json.dumps(self.to_dict(), sort_keys=True, ensure_ascii=False)
+        """SHA-256 content identifier, deterministic across instances.
+
+        The signature is deliberately excluded so that the client can
+        compute ``tx_id``, sign it, and attach the signature without
+        changing the identifier.
+        """
+        raw = json.dumps(self._signing_dict(), sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw.encode()).hexdigest()
 
     # ------------------------------------------------------------------
@@ -46,59 +68,80 @@ class Transaction:
     # ------------------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "sender": self.sender,
-            "receiver": self.receiver,
-            "amount": self.amount,
-            "tx_type": self.tx_type,
-            "concept": self.concept,
-            "timestamp": self.timestamp,
-        }
+        """Full serialisation, **including** the signature (for storage)."""
+        d = self._signing_dict()
+        d["signature"] = self.signature
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Transaction:
         return cls(
-            sender=data["sender"],
-            receiver=data["receiver"],
+            sender_pubkey=data["sender_pubkey"],
+            receiver_pubkey=data["receiver_pubkey"],
             amount=data["amount"],
             tx_type=data.get("tx_type", ""),
             concept=data.get("concept", ""),
+            signature=data.get("signature", ""),
             timestamp=data["timestamp"],
         )
 
     # ------------------------------------------------------------------
-    # Validation
+    # Validation (structural only — signature verified at the API layer)
     # ------------------------------------------------------------------
 
     def validate(self) -> list[str]:
-        """Return a list of validation errors (empty if valid).
+        """Return structural validation errors (empty if valid).
 
-        Structural rules only — stateless. Balance validation happens at
-        block-assembly time in the NCT's ``drain_pool_validated``.
+        Structural rules only — stateless.  Signature verification and
+        authority checks happen at ``POST /transaction`` in the NCT.
+        Balance validation happens at block-assembly time in
+        ``drain_pool_validated``.
         """
+        from shared.crypto import ED25519_PUBKEY_HEX_LEN, ED25519_SIG_HEX_LEN
+
         errors: list[str] = []
-        if not self.sender:
-            errors.append("sender must not be empty")
-        if not self.receiver:
-            errors.append("receiver must not be empty")
+
+        # -- Pubkey fields -------------------------------------------------
+        if not self.sender_pubkey:
+            errors.append("sender_pubkey must not be empty")
+        elif len(self.sender_pubkey) != ED25519_PUBKEY_HEX_LEN:
+            errors.append(
+                f"sender_pubkey must be {ED25519_PUBKEY_HEX_LEN} hex chars, "
+                f"got {len(self.sender_pubkey)}"
+            )
+
+        if not self.receiver_pubkey:
+            errors.append("receiver_pubkey must not be empty")
+        elif len(self.receiver_pubkey) != ED25519_PUBKEY_HEX_LEN:
+            errors.append(
+                f"receiver_pubkey must be {ED25519_PUBKEY_HEX_LEN} hex chars, "
+                f"got {len(self.receiver_pubkey)}"
+            )
+
+        if self.sender_pubkey and self.receiver_pubkey and self.sender_pubkey == self.receiver_pubkey:
+            errors.append("sender and receiver must be different")
+
+        # -- Amount --------------------------------------------------------
         if self.amount <= 0:
             errors.append("amount must be positive")
-        if self.sender == self.receiver:
-            errors.append("sender and receiver must be different")
-        if not self.concept:
-            errors.append("concept must not be empty")
+
+        # -- Type ----------------------------------------------------------
         if self.tx_type not in ("EARN", "SPEND"):
             errors.append("tx_type must be EARN or SPEND")
-        if self.tx_type == "EARN":
-            if self.sender != "ACADEMIC_SYSTEM":
-                errors.append("EARN sender must be ACADEMIC_SYSTEM")
-            if not self.receiver.startswith("student:"):
-                errors.append("EARN receiver must start with 'student:'")
-        if self.tx_type == "SPEND":
-            if not self.sender.startswith("student:"):
-                errors.append("SPEND sender must start with 'student:'")
-            if not self.receiver.startswith("vendor:"):
-                errors.append("SPEND receiver must start with 'vendor:'")
+
+        # -- Concept -------------------------------------------------------
+        if not self.concept:
+            errors.append("concept must not be empty")
+
+        # -- Signature -----------------------------------------------------
+        if not self.signature:
+            errors.append("signature must not be empty")
+        elif len(self.signature) != ED25519_SIG_HEX_LEN:
+            errors.append(
+                f"signature must be {ED25519_SIG_HEX_LEN} hex chars, "
+                f"got {len(self.signature)}"
+            )
+
         return errors
 
 

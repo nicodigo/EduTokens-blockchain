@@ -1,4 +1,4 @@
-"""Unit tests for chain_store (mock Redis)."""
+"""Unit tests for chain_store (mock Redis — PKI-aware)."""
 
 import json
 import unittest
@@ -13,6 +13,7 @@ from storage.chain_store import (
     save_block,
     validate_chain,
 )
+from tests._crypto_fixtures import make_keypair, sign
 
 
 # ---------------------------------------------------------------------------
@@ -23,8 +24,22 @@ def _genesis() -> Block:
     return Block.create_genesis()
 
 
-def _block1(genesis_hash: str) -> Block:
-    tx = Transaction(sender="Alice", receiver="Bob", amount=10.0, timestamp=1000.0)
+def _make_earn_tx(receiver_pub: str, authority_priv: str, authority_pub: str,
+                  amount: float = 10.0, concept: str = "TP1") -> Transaction:
+    tx = Transaction(
+        sender_pubkey=authority_pub,
+        receiver_pubkey=receiver_pub,
+        amount=amount,
+        tx_type="EARN",
+        concept=concept,
+        timestamp=1000.0,
+    )
+    tx.signature = sign(authority_priv, tx.tx_id.encode())
+    return tx
+
+
+def _block1(genesis_hash: str, student_pub: str, uni_priv: str, uni_pub: str) -> Block:
+    tx = _make_earn_tx(student_pub, uni_priv, uni_pub)
     b = Block(
         index=1,
         timestamp=2000.0,
@@ -43,6 +58,10 @@ def _block1(genesis_hash: str) -> Block:
 
 
 class TestSaveAndGetBlock(unittest.TestCase):
+    def setUp(self):
+        self.student_priv, self.student_pub, _ = make_keypair()
+        self.uni_priv, self.uni_pub, _ = make_keypair()
+
     def test_save_appends_to_list(self):
         client = MagicMock()
         genesis = _genesis()
@@ -92,7 +111,7 @@ class TestSaveAndGetBlock(unittest.TestCase):
         save_block(client, genesis)
         self.assertEqual(get_chain_height(client), 1)
 
-        b1 = _block1(genesis.hash)
+        b1 = _block1(genesis.hash, self.student_pub, self.uni_priv, self.uni_pub)
         save_block(client, b1)
         self.assertEqual(get_chain_height(client), 2)
 
@@ -116,6 +135,10 @@ class TestSaveAndGetBlock(unittest.TestCase):
 
 
 class TestChainValidation(unittest.TestCase):
+    def setUp(self):
+        self.student_priv, self.student_pub, _ = make_keypair()
+        self.uni_priv, self.uni_pub, _ = make_keypair()
+
     def test_validate_empty_chain(self):
         client = MagicMock()
         client.llen.return_value = 0
@@ -123,7 +146,7 @@ class TestChainValidation(unittest.TestCase):
 
     def test_validate_valid_two_block_chain(self):
         genesis = _genesis()
-        b1 = _block1(genesis.hash)
+        b1 = _block1(genesis.hash, self.student_pub, self.uni_priv, self.uni_pub)
 
         storage: list[str] = [json.dumps(genesis.to_dict(), sort_keys=True),
                               json.dumps(b1.to_dict(), sort_keys=True)]
@@ -143,11 +166,13 @@ class TestChainValidation(unittest.TestCase):
 
     def test_validate_detects_broken_chain(self):
         genesis = _genesis()
+        tx = _make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub,
+                           amount=1.0)
         # Deliberately wrong previous_hash
         bad_block = Block(
             index=1,
             timestamp=2000.0,
-            transactions=[Transaction(sender="X", receiver="Y", amount=1.0, timestamp=1.0)],
+            transactions=[tx],
             previous_hash="0" * 64,  # should be genesis.hash
             difficulty=4,
             nonce=0,
