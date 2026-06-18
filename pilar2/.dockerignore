@@ -1,0 +1,39 @@
+# Docker build context exclusions
+# Prevents bloated build context from being sent to the Docker daemon.
+# Each Dockerfile only COPYs specific directories, but without this file
+# the entire project tree (including .git/, pilar1/, tests/, etc.) is
+# uploaded as build context on every `docker build`.
+
+# Version control
+.git
+
+# Audit artifacts (growing, irrelevant to runtime)
+.artifacts
+
+# Test files (not needed in production images)
+tests
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+
+# Documentation (inflates context, not used at runtime)
+*.md
+
+# Pilar 1 (CUDA code, irrelevant to Pilar 2 services)
+pilar1
+
+# Secrets and environment (excluded by .gitignore, reinforced here)
+.env
+.env.*
+secrets.json
+
+# IDE / editor
+.vscode
+.idea
+
+# Virtual environments
+.venv
+venv
+env

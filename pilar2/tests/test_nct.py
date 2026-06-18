@@ -640,5 +640,106 @@ class TestResultLoopBackoff(unittest.TestCase):
         self.assertEqual(idle_ms, 100)
 
 
+class TestAuthorityPubkeyWarning(unittest.TestCase):
+    """Verify startup warning when AUTHORITY_PUBKEY is empty (audit M1)."""
+
+    def test_warning_when_pubkey_empty(self):
+        from nct.nct import load_config
+
+        with patch.dict("os.environ", {"AUTHORITY_PUBKEY": ""}):
+            with self.assertLogs("nct.nct", level="WARNING") as cm:
+                load_config()
+            self.assertTrue(
+                any("AUTHORITY_PUBKEY is not configured" in msg for msg in cm.output),
+                f"Expected warning not found in: {cm.output}",
+            )
+
+    def test_no_warning_when_pubkey_set(self):
+        from nct.nct import load_config
+
+        with patch.dict("os.environ", {"AUTHORITY_PUBKEY": "A" * 64}):
+            with self.assertNoLogs("nct.nct", level="WARNING"):
+                load_config()
+
+
+class TestRateLimit(unittest.TestCase):
+    """Verify rate limiting on POST /transaction (audit H4).
+
+    Because ``_limiter`` is a module-level singleton in ``nct.nct``,
+    the rate-limit storage is shared across all FastAPI apps created
+    in-process.  We demonstrate rate-limit enforcement by building a
+    single app with a very low limit, exhausting it, and verifying the
+    429 response.
+    """
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+
+        from tests._crypto_fixtures import make_keypair, sign
+
+        self.TestClient = TestClient
+        self.make_keypair = make_keypair
+
+    def _build_app(self, rate_limit: str = "3/minute"):
+        """Build a FastAPI app with the given rate limit and an empty pool."""
+        from unittest.mock import MagicMock
+
+        from nct.nct import create_health_app
+        from nct.state import NCTConfig, NCTState
+
+        state = NCTState()
+        redis_mock = MagicMock()
+        redis_mock.get.return_value = b"0"  # nonce = 0
+        redis_mock.llen.return_value = 1   # chain height placeholder
+
+        config = NCTConfig(rate_limit=rate_limit)
+        config.authority_pubkey = "A" * 64  # allow EARN
+
+        return create_health_app(state, redis_mock, config)
+
+    def test_rate_limit_enforces_429_after_exhaustion(self):
+        """Exhaust a 3/minute bucket, then verify the fourth request is 429."""
+        limit = 3
+        app = self._build_app(rate_limit=f"{limit}/minute")
+        _, authority_pub, _ = self.make_keypair()
+        _, alice_pub, _ = self.make_keypair()
+
+        with self.TestClient(app) as tc:
+            # First `limit` requests are processed (400 expected — invalid sig)
+            for i in range(limit):
+                tx = {
+                    "sender_pubkey": authority_pub,
+                    "receiver_pubkey": alice_pub,
+                    "amount": 1,
+                    "tx_type": "EARN",
+                    "concept": f"ok-{i}",
+                    "signature": "A" * 128,
+                    "nonce": 0,
+                }
+                resp = tc.post("/transaction", json=tx)
+                self.assertNotEqual(
+                    resp.status_code, 429,
+                    f"request {i}: unexpected 429 too early",
+                )
+
+            # The next request must be rate-limited
+            tx = {
+                "sender_pubkey": authority_pub,
+                "receiver_pubkey": alice_pub,
+                "amount": 1,
+                "tx_type": "EARN",
+                "concept": "over-limit",
+                "signature": "A" * 128,
+                "nonce": 0,
+            }
+            resp = tc.post("/transaction", json=tx)
+            self.assertEqual(
+                resp.status_code, 429,
+                f"Expected 429 after {limit} requests, "
+                f"got {resp.status_code}: {resp.json()}",
+            )
+            self.assertIn("rate limit", resp.json()["error"].lower())
+
+
 if __name__ == "__main__":
     unittest.main()

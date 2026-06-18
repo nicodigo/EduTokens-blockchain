@@ -25,6 +25,7 @@ class NCTConfig:
     authority_pubkey: str = ""
     heartbeat_timeout: float = 15.0
     heartbeat_interval: float = 5.0
+    rate_limit: str = "100/minute"
 
 
 class NCTState:

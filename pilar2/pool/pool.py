@@ -43,6 +43,7 @@ from broker.broker import (
 )
 from broker.messages import ControlMessage, ResultMessage, TaskMessage
 from shared.block import Block
+from shared.env import env_int, env_float
 from shared.schemas import HealthResponse
 
 logger = logging.getLogger(__name__)
@@ -110,12 +111,8 @@ class PoolCoordinator:
         self._monitor_thread: Optional[threading.Thread] = None
         self._monitor_active: threading.Event = threading.Event()
         self._original_worker_count: int = 0
-        self._monitor_interval = float(
-            os.getenv("POOL_MONITOR_INTERVAL", str(DEFAULT_MONITOR_INTERVAL))
-        )
-        self._result_timeout = float(
-            os.getenv("POOL_RESULT_TIMEOUT", str(DEFAULT_RESULT_TIMEOUT))
-        )
+        self._monitor_interval = env_float("POOL_MONITOR_INTERVAL", DEFAULT_MONITOR_INTERVAL)
+        self._result_timeout = env_float("POOL_RESULT_TIMEOUT", DEFAULT_RESULT_TIMEOUT)
 
         self._shutdown: threading.Event = threading.Event()
         self._channel: Any = None
@@ -160,9 +157,7 @@ class PoolCoordinator:
         # NCT heartbeat — register this pool as a "worker" so the NCT
         # knows the pool is alive (audit H2 corrected: pool IS the worker
         # from the NCT's perspective)
-        self._nct_heartbeat_interval = float(
-            os.getenv("POOL_NCT_HEARTBEAT_INTERVAL", "30")
-        )
+        self._nct_heartbeat_interval = env_float("POOL_NCT_HEARTBEAT_INTERVAL", 30.0)
         threading.Thread(target=self._nct_heartbeat_loop,
                          daemon=True, name="nct-heartbeat").start()
 
@@ -459,7 +454,7 @@ class PoolCoordinator:
         def health() -> HealthResponse:
             return HealthResponse(status="ok")
 
-        uvicorn.run(app, host="0.0.0.0", port=self.health_port, log_level="warning")
+        uvicorn.run(app, host="0.0.0.0", port=self.health_port, log_level="info")
 
     def _nct_heartbeat_loop(self) -> None:
         """Periodically publish a heartbeat to the NCT so it tracks this
@@ -581,8 +576,8 @@ def main() -> None:
 
     pool_id = os.getenv("POOL_ID", f"pool-{uuid.uuid4().hex[:6]}")
     rmq_url = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
-    worker_count = int(os.getenv("POOL_WORKER_COUNT", str(DEFAULT_WORKER_COUNT)))
-    health_port = int(os.getenv("HEALTH_PORT", str(DEFAULT_HEALTH_PORT)))
+    worker_count = env_int("POOL_WORKER_COUNT", DEFAULT_WORKER_COUNT)
+    health_port = env_int("HEALTH_PORT", DEFAULT_HEALTH_PORT)
 
     coordinator = PoolCoordinator(
         pool_id=pool_id,

@@ -31,6 +31,7 @@ from broker.broker import (
 )
 from broker.messages import ControlMessage, ResultMessage, TaskMessage
 from miner.miner import MinerService
+from shared.env import env_int, env_float
 from shared.schemas import (
     HealthResponse,
     WorkerHealthResponse,
@@ -220,7 +221,7 @@ class WorkerService:
 
     def _run_health_server(self, app: FastAPI) -> None:
         logger.info("Worker health server listening on port %d", self.health_port)
-        uvicorn.run(app, host="0.0.0.0", port=self.health_port, log_level="warning")
+        uvicorn.run(app, host="0.0.0.0", port=self.health_port, log_level="info")
 
     # ------------------------------------------------------------------
     # Heartbeat
@@ -405,8 +406,8 @@ def main() -> None:
     worker_id = os.getenv("WORKER_ID", f"worker-{uuid.uuid4().hex[:8]}")
     rmq_url = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
     miner_binary = os.getenv("MINER_BINARY", "./md5_range")
-    heartbeat = float(os.getenv("HEARTBEAT_INTERVAL", str(DEFAULT_HEARTBEAT_INTERVAL)))
-    health_port = int(os.getenv("HEALTH_PORT", str(DEFAULT_HEALTH_PORT)))
+    heartbeat = env_float("HEARTBEAT_INTERVAL", DEFAULT_HEARTBEAT_INTERVAL)
+    health_port = env_int("HEALTH_PORT", DEFAULT_HEALTH_PORT)
     pool_id = os.getenv("POOL_ID") or None
 
     worker = WorkerService(

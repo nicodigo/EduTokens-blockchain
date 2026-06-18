@@ -20,7 +20,10 @@ import time
 from typing import Any, Optional
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from broker.broker import (
     RESULTS_QUEUE,
@@ -59,38 +62,44 @@ from storage.chain_store import (
     validate_chain,
 )
 
+from shared.env import env_int, env_float
+
+# ---------------------------------------------------------------------------
+# Rate limiting (H4 — audit-05)
+# ---------------------------------------------------------------------------
+_limiter = Limiter(key_func=get_remote_address)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _env_int(name: str, default: int) -> int:
-    return int(os.getenv(name, str(default)))
-
-
-def _env_float(name: str, default: float) -> float:
-    return float(os.getenv(name, str(default)))
-
 
 def load_config() -> NCTConfig:
-    difficulty = _env_int("DIFFICULTY", 4)
-    if difficulty < 1 or difficulty > 10:
-        raise ValueError(
-            f"DIFFICULTY must be 1-10 (MD5 GPU mining infeasible beyond 10), "
+    difficulty = env_int("DIFFICULTY", 4, min_val=1)
+    if difficulty > 10:
+        raise SystemExit(
+            f"DIFFICULTY must be <= 10 (MD5 GPU mining infeasible beyond 10), "
             f"got {difficulty}"
         )
+
+    authority_pubkey = os.getenv("AUTHORITY_PUBKEY", "")
+
+    if not authority_pubkey:
+        logger.warning("AUTHORITY_PUBKEY is not configured — EARN transactions will be rejected")
 
     return NCTConfig(
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379"),
         rabbitmq_url=os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
-        worker_count=_env_int("WORKER_COUNT", 2),
-        block_size=_env_int("BLOCK_SIZE", 5),
-        block_timeout=_env_float("BLOCK_TIMEOUT", 30.0),
+        worker_count=env_int("WORKER_COUNT", 2),
+        block_size=env_int("BLOCK_SIZE", 5),
+        block_timeout=env_float("BLOCK_TIMEOUT", 30.0),
         difficulty=difficulty,
-        nonce_space=_env_int("NONCE_SPACE", 1_000_000_000),
-        port=_env_int("PORT", 8080),
-        authority_pubkey=os.getenv("AUTHORITY_PUBKEY", ""),
+        nonce_space=env_int("NONCE_SPACE", 1_000_000_000),
+        port=env_int("PORT", 8080),
+        rate_limit=os.getenv("RATE_LIMIT", "100/minute"),
+        authority_pubkey=authority_pubkey,
     )
 
 
@@ -466,6 +475,15 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
     """
     app = FastAPI(title="NCT", version="1.0.0")
 
+    # Rate-limit middleware (H4 — audit-05)
+    app.state.limiter = _limiter
+
+    async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+        from fastapi.responses import JSONResponse as JR
+        return JR(status_code=429, content={"error": "Too many requests — rate limit exceeded"})
+
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
+
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
         return HealthResponse(status="ok")
@@ -483,9 +501,10 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
         "/transaction",
         response_model=TransactionResponse,
         status_code=201,
-        responses={400: {"model": ErrorResponse}},
+        responses={400: {"model": ErrorResponse}, 429: {"description": "Rate limit exceeded"}},
     )
-    def create_transaction(tx: TransactionRequest) -> TransactionResponse:
+    @_limiter.limit(config.rate_limit)
+    def create_transaction(request: Request, tx: TransactionRequest) -> TransactionResponse:
         from fastapi.responses import JSONResponse
         from shared.crypto import verify as crypto_verify
 
@@ -596,7 +615,7 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
 def health_loop(app: FastAPI, port: int) -> None:
     """Thread 3 — serve the FastAPI app via uvicorn."""
     logger.info("Health server listening on port %d", port)
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", limit_concurrency=100)
 
 
 # ---------------------------------------------------------------------------

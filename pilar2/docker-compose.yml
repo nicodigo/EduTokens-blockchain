@@ -16,7 +16,7 @@ services:
     image: rabbitmq:3-management-alpine
     ports:
       - "5672:5672"
-      - "15672:15672"
+      - "127.0.0.1:15672:15672"
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
       interval: 5s
@@ -29,11 +29,13 @@ services:
       dockerfile: nct/Dockerfile
     ports:
       - "8080:8080"
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+    env_file: .env
     environment:
       - REDIS_URL=redis://redis:6379
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
@@ -43,7 +45,13 @@ services:
       - NONCE_SPACE=1000000000
       - PORT=8080
       - LOG_FILE=/var/log/nct.log
+      - RATE_LIMIT=100/minute
       - AUTHORITY_PUBKEY=
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
   pool-a:
     build:
@@ -51,15 +59,22 @@ services:
       dockerfile: pool/Dockerfile
     ports:
       - "8090:8090"
+    restart: unless-stopped
     depends_on:
       rabbitmq:
         condition: service_healthy
+    env_file: .env
     environment:
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - POOL_ID=pool-a
       - POOL_WORKER_COUNT=2
       - HEALTH_PORT=8090
       - LOG_FILE=/var/log/pool-a.log
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
   worker-a1:
     build:
@@ -67,9 +82,11 @@ services:
       dockerfile: worker/Dockerfile
     ports:
       - "8081:8081"
+    restart: unless-stopped
     depends_on:
       rabbitmq:
         condition: service_healthy
+    env_file: .env
     environment:
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - MINER_BINARY=python3 /app/miner/cpu_miner.py
@@ -78,6 +95,11 @@ services:
       - HEARTBEAT_INTERVAL=5
       - HEALTH_PORT=8081
       - LOG_FILE=/var/log/worker-a1.log
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
   worker-a2:
     build:
@@ -85,9 +107,11 @@ services:
       dockerfile: worker/Dockerfile
     ports:
       - "8082:8081"
+    restart: unless-stopped
     depends_on:
       rabbitmq:
         condition: service_healthy
+    env_file: .env
     environment:
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - MINER_BINARY=python3 /app/miner/cpu_miner.py
@@ -96,6 +120,11 @@ services:
       - HEARTBEAT_INTERVAL=5
       - HEALTH_PORT=8081
       - LOG_FILE=/var/log/worker-a2.log
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
 volumes:
   redis_data:
