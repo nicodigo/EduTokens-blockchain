@@ -49,8 +49,11 @@ class TestHeartbeatTracking(unittest.TestCase):
         self.assertEqual(self.pool._get_active_worker_count(), 3)
 
     def test_worker_expiry(self):
-        old = time.time() - 10
-        self.pool._on_worker_heartbeat(None, None, None, _heartbeat_json("w1", ts=old))
+        # Timestamps from workers are now ignored (pool uses its own clock).
+        # To test expiry we must actually wait past the heartbeat_timeout.
+        self.pool._on_worker_heartbeat(None, None, None, _heartbeat_json("w1"))
+        self.assertEqual(self.pool._get_active_worker_count(), 1)
+        time.sleep(0.35)  # heartbeat_timeout is 0.3 s
         self.assertEqual(self.pool._get_active_worker_count(), 0)
 
     def test_worker_stays_with_recent_heartbeat(self):
@@ -59,14 +62,13 @@ class TestHeartbeatTracking(unittest.TestCase):
         self.assertEqual(self.pool._get_active_worker_count(), 1)
 
     def test_new_heartbeat_resets_expiry(self):
-        now = time.time()
-        old = now - 0.2
-        self.pool._on_worker_heartbeat(None, None, None, _heartbeat_json("w1", ts=old))
-        self.assertEqual(self.pool._get_active_worker_count(), 1)
-        # Register a heartbeat explicitly 0.1s in the past — still within 0.3s timeout
-        self.pool._on_worker_heartbeat(None, None, None, _heartbeat_json("w1", ts=now - 0.1))
-        # Now advance past the old one's expiry but not the new one's
-        time.sleep(0.15)
+        # Send first heartbeat, wait a bit, send another to reset the timer.
+        self.pool._on_worker_heartbeat(None, None, None, _heartbeat_json("w1"))
+        time.sleep(0.15)  # still well within 0.3 s timeout
+        # Second heartbeat resets the expiry clock
+        self.pool._on_worker_heartbeat(None, None, None, _heartbeat_json("w1"))
+        # First heartbeat would be ~0.35 s old, but second is only ~0.2 s
+        time.sleep(0.2)
         self.assertEqual(self.pool._get_active_worker_count(), 1)
 
     def test_fallback_when_no_heartbeats(self):

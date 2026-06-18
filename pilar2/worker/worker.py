@@ -130,14 +130,6 @@ class WorkerService:
             declare_consumer_queue(self._channel, inbox, "task.mining")
             tasks_queue = inbox
 
-        # Register immediately (safe — called from main thread before start_consuming)
-        self._send_heartbeat(self._channel)
-
-        # Background heartbeat thread
-        threading.Thread(
-            target=self._heartbeat_loop, daemon=True, name="heartbeat",
-        ).start()
-
         # Health HTTP server thread (FastAPI via uvicorn)
         health_app = _create_health_app(self)
         threading.Thread(
@@ -150,6 +142,17 @@ class WorkerService:
 
         # Task consumer (blocking — must be last)
         self._setup_task_consumer(tasks_queue)
+
+        # Send first heartbeat only after task consumer is set up.
+        # This serves as the readiness signal: the pool won't count us
+        # as active until it sees at least one heartbeat post-init.
+        self._send_heartbeat(self._channel)
+
+        # Background heartbeat thread (periodic keep-alive)
+        threading.Thread(
+            target=self._heartbeat_loop, daemon=True, name="heartbeat",
+        ).start()
+
         logger.info("Worker %s ready (%s) — health on :%d",
                      self.worker_id,
                      f"pool={self.pool_id}" if self.pool_id else "solo",

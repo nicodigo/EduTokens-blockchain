@@ -7,6 +7,9 @@ back to the NCT.
 Worker count is determined dynamically from heartbeats; ``POOL_WORKER_COUNT``
 is used as a fallback when no heartbeat data is available yet.
 
+A background monitor thread detects workers that die mid-mining and
+re-publishes orphaned sub-ranges without waiting for the NCT timeout.
+
 Usage::
 
     python -m pool.pool
@@ -49,6 +52,8 @@ DEFAULT_WORKER_COUNT = 2
 DEFAULT_NONCE_SPACE = 1_000_000_000
 DEFAULT_HEALTH_PORT = 8090
 DEFAULT_HEARTBEAT_TIMEOUT = 15.0
+DEFAULT_MONITOR_INTERVAL = 5.0        # seconds between dead-worker checks
+DEFAULT_RESULT_TIMEOUT = 60.0         # seconds before logging slow-mining warning
 
 # ---------------------------------------------------------------------------
 # PoolCoordinator
@@ -86,11 +91,24 @@ class PoolCoordinator:
         self._current_fingerprint: str = ""
         self._current_difficulty: int = 0
         self._current_task_id: str = ""
+        self._current_nonce_space: int = DEFAULT_NONCE_SPACE
 
         # Worker heartbeat tracking (dynamic worker count)
         self._heartbeat_lock = threading.Lock()
         self._heartbeat_timeout = heartbeat_timeout
         self._worker_heartbeats: dict[str, float] = {}
+        self._ready_workers: set[str] = set()  # workers that have sent ≥1 heartbeat post-init
+
+        # Dead-worker monitor
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._monitor_active: threading.Event = threading.Event()
+        self._original_worker_count: int = 0
+        self._monitor_interval = float(
+            os.getenv("POOL_MONITOR_INTERVAL", str(DEFAULT_MONITOR_INTERVAL))
+        )
+        self._result_timeout = float(
+            os.getenv("POOL_RESULT_TIMEOUT", str(DEFAULT_RESULT_TIMEOUT))
+        )
 
         self._shutdown: threading.Event = threading.Event()
         self._channel: Any = None
@@ -148,6 +166,7 @@ class PoolCoordinator:
 
     def shutdown(self) -> None:
         self._shutdown.set()
+        self._monitor_active.clear()
         if self._channel is not None:
             try:
                 self._channel.stop_consuming()
@@ -161,12 +180,12 @@ class PoolCoordinator:
     def _on_worker_heartbeat(self, _ch: Any, _method: Any, _props: Any, body: bytes) -> None:
         data = json.loads(body.decode())
         with self._heartbeat_lock:
-            self._worker_heartbeats[data["worker_id"]] = data.get(
-                "timestamp", time.time()
-            )
+            # Always use pool's clock — ignore worker timestamp (clocks may skew)
+            self._worker_heartbeats[data["worker_id"]] = time.time()
+            self._ready_workers.add(data["worker_id"])
 
     def _get_active_worker_count(self) -> int:
-        """Return number of workers that sent a heartbeat recently."""
+        """Return number of ready workers that sent a heartbeat recently."""
         cutoff = time.time() - self._heartbeat_timeout
         with self._heartbeat_lock:
             stale = [
@@ -174,7 +193,12 @@ class PoolCoordinator:
             ]
             for wid in stale:
                 del self._worker_heartbeats[wid]
-            return len(self._worker_heartbeats)
+                self._ready_workers.discard(wid)
+            # Only count workers that are alive AND ready (initialised)
+            return len([
+                wid for wid in self._worker_heartbeats
+                if wid in self._ready_workers
+            ])
 
     # ------------------------------------------------------------------
     # Mining task → partition & distribute
@@ -192,6 +216,17 @@ class PoolCoordinator:
             if count == 0:
                 logger.warning("No active workers and fallback is 0 — skipping block %d",
                                task.block_index)
+                # Signal NCT so it doesn't wait uselessly
+                self._channel.basic_publish(
+                    exchange=EXCHANGE,
+                    routing_key=f"worker.{self.pool_id}.status",
+                    body=json.dumps({
+                        "worker_id": self.pool_id,
+                        "action": "pool_no_workers",
+                        "block_index": task.block_index,
+                        "timestamp": time.time(),
+                    }, sort_keys=True),
+                )
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 return
             logger.info("No heartbeats yet; using fallback worker_count=%d", count)
@@ -200,6 +235,7 @@ class PoolCoordinator:
         self._current_fingerprint = task.fingerprint
         self._current_difficulty = task.difficulty
         self._current_task_id = task.task_id
+        self._current_nonce_space = task.range_max - task.range_min + 1
 
         publish_tasks(
             self._channel,
@@ -207,9 +243,18 @@ class PoolCoordinator:
             fingerprint=task.fingerprint,
             difficulty=task.difficulty,
             num_workers=count,
-            range_size=task.range_max - task.range_min + 1,
+            range_size=self._current_nonce_space,
             routing_key_prefix=f"pool.{self.pool_id}.task",
         )
+
+        # Start dead-worker monitor
+        self._original_worker_count = count
+        self._monitor_active.set()
+        if self._monitor_thread is None or not self._monitor_thread.is_alive():
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_loop, daemon=True, name="monitor",
+            )
+            self._monitor_thread.start()
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
@@ -221,7 +266,7 @@ class PoolCoordinator:
         result = ResultMessage.from_json(body.decode())
 
         # Stale check
-        if result.block_index != self._current_block_index:
+        if self._current_block_index is None or result.block_index != self._current_block_index:
             return
 
         # Verify PoW locally before forwarding
@@ -245,8 +290,13 @@ class PoolCoordinator:
         logger.info("Pool %s: valid nonce %d from %s — forwarded to NCT",
                      self.pool_id, result.nonce, result.worker_id)
 
-        # Abort pool workers
+        # Abort pool workers and reset mining context
         self._broadcast_abort(self._current_task_id)
+        self._monitor_active.clear()
+        self._current_block_index = None
+        self._current_fingerprint = ""
+        self._current_difficulty = 0
+        self._current_task_id = ""
 
     # ------------------------------------------------------------------
     # Abort
@@ -260,6 +310,71 @@ class PoolCoordinator:
             body=msg.to_json(),
         )
         logger.info("Pool %s: broadcast abort for task %s", self.pool_id, task_id)
+
+    # ------------------------------------------------------------------
+    # Dead-worker monitor
+    # ------------------------------------------------------------------
+
+    def _monitor_loop(self) -> None:
+        """Periodically check if workers died mid-mining and re-publish if so.
+
+        Only reacts when the active worker count drops below what it was
+        when the task was published — this indicates a worker died and its
+        sub-range is orphaned.  Does NOT republish when workers are alive
+        but slow; the NCT timeout handles that case.
+        """
+        start = time.time()
+        while self._monitor_active.is_set():
+            self._monitor_active.wait(timeout=self._monitor_interval)
+            if not self._monitor_active.is_set():
+                return
+
+            # Already forwarded a result for this block?
+            if self._current_block_index is None:
+                return
+
+            active = self._get_active_worker_count()
+            elapsed = time.time() - start
+
+            if active < self._original_worker_count:
+                logger.warning(
+                    "Worker(s) died mid-mining: %d→%d active. "
+                    "Re-publishing for block %d.",
+                    self._original_worker_count, active,
+                    self._current_block_index,
+                )
+                if active > 0 or self._worker_count_fallback > 0:
+                    count = active if active > 0 else self._worker_count_fallback
+                    publish_tasks(
+                        self._channel,
+                        block_index=self._current_block_index,
+                        fingerprint=self._current_fingerprint,
+                        difficulty=self._current_difficulty,
+                        num_workers=count,
+                        range_size=self._current_nonce_space,
+                        routing_key_prefix=f"pool.{self.pool_id}.task",
+                    )
+                    self._original_worker_count = count
+                else:
+                    # No workers left at all — signal NCT
+                    self._channel.basic_publish(
+                        exchange=EXCHANGE,
+                        routing_key=f"worker.{self.pool_id}.status",
+                        body=json.dumps({
+                            "worker_id": self.pool_id,
+                            "action": "pool_no_workers",
+                            "block_index": self._current_block_index,
+                            "timestamp": time.time(),
+                        }, sort_keys=True),
+                    )
+                    return  # no workers left, stop monitoring
+
+            elif elapsed > self._result_timeout:
+                logger.warning(
+                    "Block %d: no result after %.0fs with %d workers still alive. "
+                    "Waiting for NCT timeout + range expansion.",
+                    self._current_block_index, elapsed, active,
+                )
 
     # ------------------------------------------------------------------
     # Health

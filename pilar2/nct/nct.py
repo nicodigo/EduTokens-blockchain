@@ -347,7 +347,13 @@ def result_loop(
         )
         if method and body:
             data = json.loads(body.decode())
-            state.update_worker(data["worker_id"])
+            if data.get("action") == "pool_no_workers":
+                logger.warning(
+                    "Pool '%s' reports no workers for block %s",
+                    data.get("worker_id"), data.get("block_index"),
+                )
+            else:
+                state.update_worker(data.get("worker_id", "unknown"))
             had_work = True
 
         if not had_work:

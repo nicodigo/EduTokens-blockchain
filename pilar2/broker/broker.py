@@ -50,6 +50,13 @@ def get_connection(
     if url is None:
         url = os.getenv("RABBITMQ_URL", "amqp://localhost:5672")
 
+    # AMQP heartbeat for fast dead-connection detection (default 5 s).
+    # pika.URLParameters parses ?heartbeat=N from the query string.
+    amqp_heartbeat = int(os.getenv("AMQP_HEARTBEAT", "5"))
+    if "heartbeat=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}heartbeat={amqp_heartbeat}"
+
     for attempt in range(1, max_retries + 1):
         try:
             connection = pika.BlockingConnection(pika.URLParameters(url))
