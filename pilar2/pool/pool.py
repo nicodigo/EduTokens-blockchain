@@ -17,7 +17,6 @@ Usage::
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -43,6 +42,7 @@ from broker.broker import (
     reconnect_rabbitmq,
 )
 from broker.messages import ControlMessage, ResultMessage, TaskMessage
+from shared.block import Block
 from shared.schemas import HealthResponse
 
 logger = logging.getLogger(__name__)
@@ -152,6 +152,15 @@ class PoolCoordinator:
 
         # Health HTTP server
         threading.Thread(target=self._run_health, daemon=True, name="health").start()
+
+        # NCT heartbeat — register this pool as a "worker" so the NCT
+        # knows the pool is alive (audit H2 corrected: pool IS the worker
+        # from the NCT's perspective)
+        self._nct_heartbeat_interval = float(
+            os.getenv("POOL_NCT_HEARTBEAT_INTERVAL", "30")
+        )
+        threading.Thread(target=self._nct_heartbeat_loop,
+                         daemon=True, name="nct-heartbeat").start()
 
         # Consumers (routed by pika to the correct callback)
         self._channel.basic_qos(prefetch_count=1)
@@ -275,16 +284,18 @@ class PoolCoordinator:
         if self._current_block_index is None or result.block_index != self._current_block_index:
             return
 
-        # Verify PoW locally before forwarding
-        pow_hash = hashlib.md5(
-            (self._current_fingerprint + str(result.nonce)).encode()
-        ).hexdigest()
-        if pow_hash != result.hash:
-            logger.warning("Pool %s: invalid PoW from %s — dropped", self.pool_id, result.worker_id)
-            return
-        if not pow_hash.startswith("0" * self._current_difficulty):
-            logger.warning("Pool %s: difficulty not met by %s — dropped",
-                           self.pool_id, result.worker_id)
+        # Verify PoW locally before forwarding (canonical check via Block)
+        valid, pow_hash = Block.verify_result(
+            self._current_fingerprint,
+            self._current_difficulty,
+            result.nonce,
+            result.hash,
+        )
+        if not valid:
+            logger.warning(
+                "Pool %s: invalid PoW from %s (hash=%s) — dropped",
+                self.pool_id, result.worker_id, pow_hash,
+            )
             return
 
         # Forward valid solution to NCT
@@ -398,6 +409,31 @@ class PoolCoordinator:
             return HealthResponse(status="ok")
 
         uvicorn.run(app, host="0.0.0.0", port=self.health_port, log_level="warning")
+
+    def _nct_heartbeat_loop(self) -> None:
+        """Periodically publish a heartbeat to the NCT so it tracks this
+        pool as a worker entity (audit H2 corrected).
+
+        Uses routing key ``worker.{pool_id}`` so the NCT's
+        ``worker_registry`` queue receives it via the ``worker.#`` binding.
+        """
+        while not self._shutdown.wait(timeout=self._nct_heartbeat_interval):
+            try:
+                self._channel.basic_publish(
+                    exchange=EXCHANGE,
+                    routing_key=f"worker.{self.pool_id}",
+                    body=json.dumps({
+                        "worker_id": self.pool_id,
+                        "role": "pool",
+                        "timestamp": time.time(),
+                    }, sort_keys=True),
+                    properties=persistent_props(),
+                )
+            except Exception:
+                logger.debug(
+                    "Pool %s NCT heartbeat failed — channel may be reconnecting",
+                    self.pool_id,
+                )
 
 
 # ---------------------------------------------------------------------------

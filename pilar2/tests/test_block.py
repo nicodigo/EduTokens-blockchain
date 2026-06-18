@@ -188,6 +188,19 @@ class TestTransaction(unittest.TestCase):
         tx.amount = -5
         self.assertTrue(tx.validate())
 
+    def test_excessive_amount_fails(self):
+        """Audit M3: amount must not exceed 1,000,000,000."""
+        tx = _make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub)
+        tx.amount = 1_000_000_000
+        self.assertEqual(tx.validate(), [])
+
+        tx.amount = 1_000_000_001
+        errors = tx.validate()
+        self.assertTrue(
+            any("amount must not exceed" in e for e in errors),
+            f"expected ceiling error, got {errors}",
+        )
+
     def test_empty_concept_fails(self):
         tx = _make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub)
         tx.concept = ""
@@ -535,6 +548,46 @@ class TestBlock(unittest.TestCase):
         )
         block1.hash = block1.compute_hash()
         self.assertFalse(Block.verify_pow(block1))
+
+    # ------------------------------------------------------------------
+    # Block.verify_result  (audit H3 — canonical worker-result check)
+    # ------------------------------------------------------------------
+
+    def test_verify_result_accepts_valid_pow(self):
+        """Block.verify_result must return True for a correct hash that meets
+        the difficulty prefix."""
+        fingerprint = "dummy-fp"
+        difficulty = 2
+        # Brute-force a valid (nonce, hash) pair
+        for nonce in range(100000):
+            import hashlib
+            h = hashlib.md5((fingerprint + str(nonce)).encode()).hexdigest()
+            if h.startswith("0" * difficulty):
+                break
+        valid, actual = Block.verify_result(fingerprint, difficulty, nonce, h)
+        self.assertTrue(valid, f"nonce={nonce} hash={actual}")
+        self.assertEqual(actual, h)
+
+    def test_verify_result_rejects_hash_mismatch(self):
+        """Correct prefix but wrong hash — must reject."""
+        valid, actual = Block.verify_result("abc", 4, 42, "0000deadbeef")
+        self.assertFalse(valid)
+
+    def test_verify_result_rejects_difficulty_not_met(self):
+        """Hash matches but prefix doesn't — must reject."""
+        import hashlib
+        fingerprint = "xyz"
+        h = hashlib.md5((fingerprint + "0").encode()).hexdigest()
+        valid, actual = Block.verify_result(fingerprint, 4, 0, h)
+        self.assertFalse(valid)
+
+    def test_verify_result_returns_32_char_md5_hex(self):
+        """Actual hash must always be a 32-char lowercase hex string."""
+        valid, actual = Block.verify_result("abc", 1, 0, "dummy")
+        self.assertFalse(valid)  # doesn't match, but format must be correct
+        self.assertIsInstance(actual, str)
+        self.assertEqual(len(actual), 32)
+        self.assertTrue(all(c in "0123456789abcdef" for c in actual))
 
     def test_block_serialisation_includes_signatures(self):
         genesis = Block.create_genesis()

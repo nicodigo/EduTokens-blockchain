@@ -40,6 +40,11 @@ class AccountResponse(BaseModel):
     )
     balance: int
     nonce: int = Field(..., ge=0, description="Next expected nonce for this account")
+    discarded_transactions: list[str] = Field(
+        default_factory=list,
+        description="tx_ids of transactions from this account "
+        "that were discarded during block assembly",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +70,10 @@ class TransactionRequest(BaseModel):
         pattern=_PUBKEY_HEX_RE,
         description="Ed25519 public key of the receiver (64 hex chars)",
     )
-    amount: int = Field(..., gt=0, description="Amount to transfer, in smallest unit")
+    amount: int = Field(
+        ..., gt=0, le=1_000_000_000,
+        description="Amount to transfer, in smallest unit (max 1 000 000 000)",
+    )
     tx_type: str = Field(
         ..., pattern=r"^(EARN|SPEND)$", description="Transaction type: EARN or SPEND"
     )

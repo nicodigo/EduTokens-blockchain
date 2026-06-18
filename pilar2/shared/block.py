@@ -129,6 +129,8 @@ class Transaction:
         # -- Amount --------------------------------------------------------
         if self.amount <= 0:
             errors.append("amount must be positive")
+        elif self.amount > 1_000_000_000:
+            errors.append("amount must not exceed 1,000,000,000")
 
         # -- Type ----------------------------------------------------------
         if self.tx_type not in ("EARN", "SPEND"):
@@ -341,10 +343,31 @@ class Block:
         return errors
 
     @staticmethod
+    def verify_result(
+        fingerprint: str,
+        difficulty: int,
+        nonce: int,
+        claimed_hash: str,
+    ) -> tuple[bool, str]:
+        """Check that *claimed_hash* is ``MD5(fingerprint + nonce)`` and meets
+        the difficulty target.
+
+        Returns ``(is_valid, actual_md5_hash)``.
+
+        Canonical verification used by the NCT and pool coordinators when
+        a worker submits a mining result.
+        """
+        pow_hash = hashlib.md5((fingerprint + str(nonce)).encode()).hexdigest()
+        valid = (pow_hash == claimed_hash) and pow_hash.startswith(
+            "0" * difficulty
+        )
+        return valid, pow_hash
+
+    @staticmethod
     def verify_pow(block: Block) -> bool:
         """Check that MD5(fingerprint + nonce) satisfies the difficulty target.
 
-        This is the canonical verification of the Proof-of-Work solution.
+        Delegates to :meth:`verify_result` for the canonical computation.
         """
         if block.index == 0:
             return True  # genesis block is not mined

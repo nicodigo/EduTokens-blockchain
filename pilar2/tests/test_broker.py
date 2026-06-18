@@ -86,7 +86,7 @@ class TestDeclareTopology(unittest.TestCase):
             exchange=EXCHANGE, queue=RESULTS_QUEUE, routing_key="result.*"
         )
         channel.queue_bind.assert_any_call(
-            exchange=EXCHANGE, queue=WORKER_REGISTRY_QUEUE, routing_key="worker.*"
+            exchange=EXCHANGE, queue=WORKER_REGISTRY_QUEUE, routing_key="worker.#"
         )
         # Audit L1: return callback registered
         channel.add_on_return_callback.assert_called_once()

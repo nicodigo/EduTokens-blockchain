@@ -54,7 +54,11 @@ class NCTState:
         self._workers: dict[str, float] = {}          # worker_id → last_seen
         self._worker_timeout: float = worker_timeout   # seconds before expiry
 
-        # -- chain height for /status (may be read without lock—best-effort) --
+        # -- chain height for /status (audit L4: reads and writes are
+        #    best-effort — not protected by self.lock.  In CPython the
+        #    GIL makes int assignment atomic, but the value seen by
+        #    /status may be stale by one block during a concurrent
+        #    handle_result call.  Acceptable for this PoC.) --
         self.chain_height: int = 0
 
     # ------------------------------------------------------------------

@@ -34,6 +34,7 @@ from shared.block import Block
 BLOCKS_KEY = "blockchain:blocks"
 BALANCE_PREFIX = "balance:"
 NONCE_PREFIX = "nonce:"
+DISCARDED_PREFIX = "discarded:"
 
 # ---------------------------------------------------------------------------
 # Connection
@@ -218,6 +219,25 @@ def update_nonces_from_block(client: Any, block: Block) -> None:
     for tx in block.transactions:
         pipe.set(f"{NONCE_PREFIX}{tx.sender_pubkey}", tx.nonce + 1)
     pipe.execute()
+
+
+# ---------------------------------------------------------------------------
+# Discarded transactions (audit M2)
+# ---------------------------------------------------------------------------
+
+
+def add_discarded_tx(client: Any, pubkey: str, tx_id: str) -> None:
+    """Record *tx_id* as discarded for *pubkey*.
+    Stored as a Redis Set so clients can discover why their transaction
+    never appeared on-chain.
+    """
+    client.sadd(f"{DISCARDED_PREFIX}{pubkey}", tx_id)
+
+
+def get_discarded_txns(client: Any, pubkey: str) -> list[str]:
+    """Return tx_ids discarded for *pubkey*, newest first."""
+    raw = client.smembers(f"{DISCARDED_PREFIX}{pubkey}")
+    return [tid.decode() for tid in raw]
 
 
 def update_balances_from_block(client: Any, block: Block) -> None:

@@ -11,7 +11,6 @@ Usage::
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -46,10 +45,12 @@ from shared.schemas import (
     TransactionResponse,
 )
 from storage.chain_store import (
+    add_discarded_tx,
     connect as redis_connect,
     get_balance,
     get_block,
     get_chain_height,
+    get_discarded_txns,
     get_latest_block,
     get_nonce,
     rebuild_state_from_chain,
@@ -91,22 +92,6 @@ def load_config() -> NCTConfig:
         port=_env_int("PORT", 8080),
         authority_pubkey=os.getenv("AUTHORITY_PUBKEY", ""),
     )
-
-
-def verify_pow_result(
-    fingerprint: str,
-    difficulty: int,
-    nonce: int,
-    claimed_hash: str,
-) -> tuple[bool, str]:
-    """Check that *claimed_hash* is ``MD5(fingerprint + nonce)`` and meets
-    the difficulty target.
-
-    Returns ``(is_valid, actual_md5_hash)``.
-    """
-    pow_hash = hashlib.md5((fingerprint + str(nonce)).encode()).hexdigest()
-    valid = (pow_hash == claimed_hash) and pow_hash.startswith("0" * difficulty)
-    return valid, pow_hash
 
 
 def drain_pool_validated(
@@ -174,6 +159,9 @@ def drain_pool_validated(
 
     if discarded:
         logger.info("%d transacción(es) descartada(s) por saldo insuficiente", len(discarded))
+        # Audit M2: record discarded tx_ids so clients can discover them
+        for tx in discarded:
+            add_discarded_tx(redis_client, tx.sender_pubkey, tx.tx_id)
 
     return valid
 
@@ -206,11 +194,15 @@ def handle_result(
         return False
 
     # ---- PoW verification ----
-    valid, actual_hash = verify_pow_result(fingerprint, difficulty, result.nonce, result.hash)
+    valid, actual_hash = Block.verify_result(fingerprint, difficulty, result.nonce, result.hash)
     if not valid:
+        current_block_index = current_block.index if current_block else "?"
         logger.warning(
-            "Invalid PoW from %s: claimed %s, actual %s (nonce=%d)",
-            result.worker_id, result.hash, actual_hash, result.nonce,
+            "Invalid PoW from %s for block %s: claimed %s, actual %s "
+            "(nonce=%d, difficulty=%d)",
+            result.worker_id, current_block_index,
+            result.hash, actual_hash, result.nonce,
+            difficulty,
         )
         return False
 
@@ -323,8 +315,11 @@ def block_loop(
         # 2. Get latest block for chaining
         latest = get_latest_block(redis_client)
         if latest is None:
-            logger.error("Chain is empty (no genesis block). Run init first.")
-            time.sleep(2)
+            # Audit L3: Redis may have been wiped mid-run — recreate genesis
+            logger.warning(
+                "Chain is empty (no genesis block). Recreating genesis…"
+            )
+            ensure_genesis(redis_client)
             continue
 
         # 3. Create new block
@@ -385,32 +380,71 @@ def result_loop(
 
         had_work = False
 
-        # ---- Poll mining results ----
+        # ---- Poll mining results (audit H1: manual ack for crash safety) ----
         method, _properties, body = channel.basic_get(
-            queue=RESULTS_QUEUE, auto_ack=True,
+            queue=RESULTS_QUEUE, auto_ack=False,
         )
         if method and body:
-            result = ResultMessage.from_json(body.decode())
-            handle_result(state, redis_client, channel, result)
+            try:
+                result = ResultMessage.from_json(body.decode())
+                handle_result(state, redis_client, channel, result)
+            except Exception:
+                logger.exception(
+                    "Failed to process mining result — nacking (no requeue)"
+                )
+                try:
+                    channel.basic_nack(
+                        delivery_tag=method.delivery_tag, requeue=False,
+                    )
+                except Exception:
+                    pass  # channel may be dead; reconnection handles it
+            else:
+                # Only ack on success — protects against crash between
+                # basic_get and handle_result (audit H1)
+                try:
+                    channel.basic_ack(delivery_tag=method.delivery_tag)
+                except Exception:
+                    pass  # channel may be dead; reconnection handles it
             had_work = True
 
         # ---- Poll worker registry (heartbeats) ----
         method, _properties, body = channel.basic_get(
-            queue=WORKER_REGISTRY_QUEUE, auto_ack=True,
+            queue=WORKER_REGISTRY_QUEUE, auto_ack=False,
         )
         if method and body:
-            data = json.loads(body.decode())
-            if data.get("action") == "pool_no_workers":
-                logger.warning(
-                    "Pool '%s' reports no workers for block %s",
-                    data.get("worker_id"), data.get("block_index"),
+            try:
+                data = json.loads(body.decode())
+                if data.get("action") == "pool_no_workers":
+                    logger.warning(
+                        "Pool '%s' reports no workers for block %s",
+                        data.get("worker_id"), data.get("block_index"),
+                    )
+                else:
+                    state.update_worker(data.get("worker_id", "unknown"))
+            except Exception:
+                logger.exception(
+                    "Failed to process worker registry message — nacking"
                 )
+                try:
+                    channel.basic_nack(
+                        delivery_tag=method.delivery_tag, requeue=False,
+                    )
+                except Exception:
+                    pass
             else:
-                state.update_worker(data.get("worker_id", "unknown"))
+                try:
+                    channel.basic_ack(delivery_tag=method.delivery_tag)
+                except Exception:
+                    pass
             had_work = True
 
-        if not had_work:
-            time.sleep(0.1)
+        # Audit L2: exponential backoff — ramps from 0.1s up to 1.0s
+        # when idle, resets to 0.1s the instant any work is found.
+        if had_work:
+            idle_ms = 100
+        else:
+            time.sleep(idle_ms / 1000.0)
+            idle_ms = min(idle_ms * 2, 1000)
 
     logger.info("Result loop stopped")
 
@@ -420,11 +454,15 @@ def result_loop(
 # ---------------------------------------------------------------------------
 
 
-def create_health_app(state: NCTState, redis_client: Any) -> FastAPI:
+def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> FastAPI:
     """Build a FastAPI app wired to the shared NCT state and Redis.
 
     The app is created once in ``main()`` and served by uvicorn in a
     background thread — same threading model as before, cleaner contracts.
+
+    *config* is passed explicitly (audit L1: no closure capture) so the
+    function can be tested in isolation without depending on the ``main()``
+    scope.
     """
     app = FastAPI(title="NCT", version="1.0.0")
 
@@ -515,17 +553,38 @@ def create_health_app(state: NCTState, redis_client: Any) -> FastAPI:
 
     @app.get("/account/{pubkey}", response_model=AccountResponse)
     def get_account(pubkey: str) -> AccountResponse:
-        """Return balance and next expected nonce for a public key."""
+        """Return balance, nonce, and discarded transaction ids (audit M2)."""
         balance = get_balance(redis_client, pubkey)
         nonce = get_nonce(redis_client, pubkey)
-        return AccountResponse(address=pubkey, balance=balance, nonce=nonce)
+        discarded = get_discarded_txns(redis_client, pubkey)
+        return AccountResponse(
+            address=pubkey,
+            balance=balance,
+            nonce=nonce,
+            discarded_transactions=discarded,
+        )
 
     @app.get("/chain", response_model=list[dict])
-    def get_chain() -> list[dict]:
-        """Return the full serialised chain (audit trail)."""
+    def get_chain(
+        start: int = 0,
+        count: int = 20,
+    ) -> list[dict]:
+        """Return a slice of the serialised chain (audit trail).
+
+        Query params:
+            start (int): first block index to return (0-based, default 0)
+            count (int): max blocks to return (default 20, max 100)
+        """
+        count = min(max(count, 0), 100)
+        if count == 0:
+            return []
+
         height = get_chain_height(redis_client)
+        start = max(start, 0)
+
         result: list[dict] = []
-        for i in range(height):
+        end = min(start + count, height)
+        for i in range(start, end):
             blk = get_block(redis_client, i)
             if blk is not None:
                 result.append(blk.to_dict())
@@ -598,26 +657,37 @@ def main() -> None:
 
     # ---- RabbitMQ ----
     rmq_conn = get_connection(url=config.rabbitmq_url)
-    channel = rmq_conn.channel()
-    declare_topology(channel)
+    # Audit C1: BlockingChannel is NOT thread-safe.  Create one channel per
+    # thread — block_loop publishes mining tasks, result_loop consumes
+    # results and polls the worker registry.  Sharing a single channel
+    # across threads causes AMQP frame corruption under load.
+    block_channel = rmq_conn.channel()
+    result_channel = rmq_conn.channel()
+    declare_topology(block_channel)  # queues/exchanges — idempotent
 
-    # Mutable refs so both threads share reconnection state (audit H2)
-    conn_ref: list[Any] = [rmq_conn]
-    ch_ref: list[Any] = [channel]
+    # Each thread gets its own (conn_ref, ch_ref) pair so reconnection
+    # is independent — one thread reconnecting does not invalidate the
+    # other's channel.
+    block_conn_ref: list[Any] = [rmq_conn]
+    block_ch_ref: list[Any] = [block_channel]
+    result_conn_ref: list[Any] = [rmq_conn]
+    result_ch_ref: list[Any] = [result_channel]
 
     # ---- Shared state ----
     state = NCTState()
     state.chain_height = 1  # genesis is block 0 → height = 1
 
     # ---- FastAPI app (wired to shared state) ----
-    health_app = create_health_app(state, redis_client)
+    health_app = create_health_app(state, redis_client, config)
 
     # ---- Threads ----
     threads = [
-        threading.Thread(target=block_loop, args=(state, redis_client, conn_ref, ch_ref, config),
+        threading.Thread(target=block_loop,
+                         args=(state, redis_client, block_conn_ref, block_ch_ref, config),
                          name="block-loop", daemon=True),
-        threading.Thread(target=result_loop, args=(state, redis_client, conn_ref, ch_ref,
-                                                    config.rabbitmq_url),
+        threading.Thread(target=result_loop,
+                         args=(state, redis_client, result_conn_ref, result_ch_ref,
+                               config.rabbitmq_url),
                          name="result-loop", daemon=True),
         threading.Thread(target=health_loop, args=(health_app, config.port),
                          name="health-loop", daemon=True),

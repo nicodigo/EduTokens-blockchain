@@ -180,7 +180,10 @@ def declare_topology(channel: Any) -> None:
 
     # Worker registry queue (workers → NCT heartbeats & registration)
     channel.queue_declare(queue=WORKER_REGISTRY_QUEUE, durable=True)
-    channel.queue_bind(exchange=EXCHANGE, queue=WORKER_REGISTRY_QUEUE, routing_key="worker.*")
+    # Audit H2 corrected: use worker.# so pools (worker.pool-a) and their
+    # status messages (worker.pool-a.status) match, not just solo workers
+    # (worker.heartbeat).  The pool is the worker from the NCT's perspective.
+    channel.queue_bind(exchange=EXCHANGE, queue=WORKER_REGISTRY_QUEUE, routing_key="worker.#")
 
     # Audit L1: log returned messages (mandatory=True publishes with no binding)
     channel.add_on_return_callback(_on_return)
