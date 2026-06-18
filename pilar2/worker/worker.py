@@ -65,10 +65,12 @@ def _create_health_app(worker: WorkerService) -> FastAPI:
 
     @app.get("/status", response_model=WorkerStatusResponse)
     def status() -> WorkerStatusResponse:
+        with worker._tasks_lock:
+            processed = worker.tasks_processed
         return WorkerStatusResponse(
             worker_id=worker.worker_id,
             current_task=worker._current_task_id,
-            tasks_processed=worker.tasks_processed,
+            tasks_processed=processed,
             uptime_seconds=_uptime(),
         )
 
@@ -109,6 +111,7 @@ class WorkerService:
         self._shutdown: threading.Event = threading.Event()
         self._channel: Any = None
         self.tasks_processed: int = 0
+        self._tasks_lock = threading.Lock()
         self.start_time: float = 0.0
 
     # ------------------------------------------------------------------
@@ -298,6 +301,21 @@ class WorkerService:
         )
 
     def _on_task(self, ch: Any, method: Any, _properties: Any, body: bytes) -> None:
+        try:
+            self._do_task(ch, method, body)
+        except Exception:
+            logger.exception(
+                "Worker %s: task failed — requeuing", self.worker_id,
+            )
+            try:
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            except Exception:
+                logger.error(
+                    "Worker %s: basic_nack also failed — message may be lost",
+                    self.worker_id,
+                )
+
+    def _do_task(self, ch: Any, method: Any, body: bytes) -> None:
         task = TaskMessage.from_json(body.decode())
         logger.info(
             "Task %s (block %d, difficulty=%d, range=[%d, %d])",
@@ -310,11 +328,19 @@ class WorkerService:
 
         target_prefix = "0" * task.difficulty
 
-        result = self.miner.mine(
+        # C1: use cancellable mining so abort signals (control messages)
+        # can interrupt a running mining task.  The process_events callback
+        # lets pika drain its I/O buffer and dispatch _on_control between
+        # polls — without this, the abort mechanism is completely ineffective.
+        result = self.miner.mine_cancellable(
             base_string=task.fingerprint,
             target_prefix=target_prefix,
             range_min=task.range_min,
             range_max=task.range_max,
+            abort_event=self._aborted,
+            process_events=lambda: self._connection.process_data_events(
+                time_limit=0.1,
+            ),
         )
 
         if self._aborted.is_set():
@@ -346,7 +372,8 @@ class WorkerService:
             logger.warning("No solution found in range [%d, %d]",
                            task.range_min, task.range_max)
 
-        self.tasks_processed += 1
+        with self._tasks_lock:
+            self.tasks_processed += 1
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
 

@@ -109,6 +109,21 @@ class TestMinerService(unittest.TestCase):
         with self.assertRaises(MinerError):
             self.service.mine("test", "0000")
 
+    @patch("subprocess.run")
+    def test_permission_error_is_caught(self, mock_run: MagicMock) -> None:
+        """H1+M4: PermissionError must be caught and wrapped in MinerError."""
+        mock_run.side_effect = PermissionError("binary not executable")
+        with self.assertRaises(MinerError) as ctx:
+            self.service.mine("test", "0000")
+        self.assertIn("binary", str(ctx.exception).lower())
+
+    @patch("subprocess.run")
+    def test_os_error_is_caught(self, mock_run: MagicMock) -> None:
+        """H1+M4: Arbitrary OSError must be caught and wrapped in MinerError."""
+        mock_run.side_effect = OSError("some OS error")
+        with self.assertRaises(MinerError):
+            self.service.mine("test", "0000")
+
 
 if __name__ == "__main__":
     unittest.main()

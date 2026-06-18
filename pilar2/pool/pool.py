@@ -98,6 +98,10 @@ class PoolCoordinator:
 
         # Worker heartbeat tracking (dynamic worker count)
         self._heartbeat_lock = threading.Lock()
+
+        # Mining context lock (audit M2: prevents races between
+        # _on_mining_task, _on_worker_result, and _monitor_loop)
+        self._mining_lock = threading.Lock()
         self._heartbeat_timeout = heartbeat_timeout
         self._worker_heartbeats: dict[str, float] = {}
         self._ready_workers: set[str] = set()  # workers that have sent ≥1 heartbeat post-init
@@ -167,7 +171,7 @@ class PoolCoordinator:
         self._channel.basic_consume(queue=inbox, on_message_callback=self._on_mining_task,
                                      auto_ack=False)
         self._channel.basic_consume(queue=results_q, on_message_callback=self._on_worker_result,
-                                     auto_ack=True)
+                                     auto_ack=False)
         self._channel.basic_consume(queue=registry_q, on_message_callback=self._on_worker_heartbeat,
                                      auto_ack=True)
 
@@ -246,11 +250,12 @@ class PoolCoordinator:
                 return
             logger.info("No heartbeats yet; using fallback worker_count=%d", count)
 
-        self._current_block_index = task.block_index
-        self._current_fingerprint = task.fingerprint
-        self._current_difficulty = task.difficulty
-        self._current_task_id = task.task_id
-        self._current_nonce_space = task.range_max - task.range_min + 1
+        with self._mining_lock:
+            self._current_block_index = task.block_index
+            self._current_fingerprint = task.fingerprint
+            self._current_difficulty = task.difficulty
+            self._current_task_id = task.task_id
+            self._current_nonce_space = task.range_max - task.range_min + 1
 
         publish_tasks(
             self._channel,
@@ -258,7 +263,7 @@ class PoolCoordinator:
             fingerprint=task.fingerprint,
             difficulty=task.difficulty,
             num_workers=count,
-            range_size=self._current_nonce_space,
+            range_size=task.range_max - task.range_min + 1,
             routing_key_prefix=f"pool.{self.pool_id}.task",
         )
 
@@ -277,17 +282,35 @@ class PoolCoordinator:
     # Worker result → verify → forward to NCT
     # ------------------------------------------------------------------
 
-    def _on_worker_result(self, _ch: Any, _method: Any, _props: Any, body: bytes) -> None:
-        result = ResultMessage.from_json(body.decode())
+    def _on_worker_result(self, ch: Any, method: Any, _props: Any, body: bytes) -> None:
+        # Parse the incoming message first — malformed bodies must be
+        # nacked so they don't block the queue (audit H2).
+        try:
+            result = ResultMessage.from_json(body.decode())
+        except Exception:
+            logger.warning(
+                "Pool %s: malformed worker result (not valid JSON) — dropped",
+                self.pool_id,
+            )
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            return
 
-        # Stale check
-        if self._current_block_index is None or result.block_index != self._current_block_index:
+        # M2: snapshot mining context under lock so the monitor thread
+        # cannot observe a half-written state.
+        with self._mining_lock:
+            current_block = self._current_block_index
+            current_fingerprint = self._current_fingerprint
+            current_difficulty = self._current_difficulty
+
+        # Stale check — block already mined, but message was processed
+        if current_block is None or result.block_index != current_block:
+            ch.basic_ack(delivery_tag=method.delivery_tag)
             return
 
         # Verify PoW locally before forwarding (canonical check via Block)
         valid, pow_hash = Block.verify_result(
-            self._current_fingerprint,
-            self._current_difficulty,
+            current_fingerprint,
+            current_difficulty,
             result.nonce,
             result.hash,
         )
@@ -296,25 +319,41 @@ class PoolCoordinator:
                 "Pool %s: invalid PoW from %s (hash=%s) — dropped",
                 self.pool_id, result.worker_id, pow_hash,
             )
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
             return
 
-        # Forward valid solution to NCT
-        self._channel.basic_publish(
-            exchange=EXCHANGE,
-            routing_key=f"result.{self.pool_id}",
-            body=result.to_json(),
-            properties=persistent_props(),
-        )
+        # Forward valid solution to NCT — if this fails, nack so the
+        # result can be retried (audit H2).
+        try:
+            self._channel.basic_publish(
+                exchange=EXCHANGE,
+                routing_key=f"result.{self.pool_id}",
+                body=result.to_json(),
+                properties=persistent_props(),
+            )
+        except Exception:
+            logger.exception(
+                "Pool %s: failed to forward result to NCT — requeuing",
+                self.pool_id,
+            )
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            return
+
         logger.info("Pool %s: valid nonce %d from %s — forwarded to NCT",
                      self.pool_id, result.nonce, result.worker_id)
 
-        # Abort pool workers and reset mining context
-        self._broadcast_abort(self._current_task_id)
-        self._monitor_active.clear()
-        self._current_block_index = None
-        self._current_fingerprint = ""
-        self._current_difficulty = 0
-        self._current_task_id = ""
+        # Ack the worker's result now that it's safely forwarded
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+
+        # M2: clear mining context under lock only if the block hasn't
+        # changed since we took the snapshot (prevents wiping a new task).
+        with self._mining_lock:
+            if self._current_block_index == current_block:
+                self._monitor_active.clear()
+                self._current_block_index = None
+                self._current_fingerprint = ""
+                self._current_difficulty = 0
+                self._current_task_id = ""
 
     # ------------------------------------------------------------------
     # Abort
@@ -349,8 +388,16 @@ class PoolCoordinator:
             if not self._monitor_active.is_set():
                 return
 
+            # M2: snapshot mining context under lock for this iteration.
+            with self._mining_lock:
+                current_block = self._current_block_index
+                current_fingerprint = self._current_fingerprint
+                current_difficulty = self._current_difficulty
+                current_nonce_space = self._current_nonce_space
+                current_task_id = self._current_task_id
+
             # Already forwarded a result for this block?
-            if self._current_block_index is None:
+            if current_block is None:
                 return
 
             active = self._get_active_worker_count()
@@ -361,17 +408,21 @@ class PoolCoordinator:
                     "Worker(s) died mid-mining: %d→%d active. "
                     "Re-publishing for block %d.",
                     self._original_worker_count, active,
-                    self._current_block_index,
+                    current_block,
                 )
+                # M1: abort surviving workers before republishing so they
+                # discard their old (now-overlapping) sub-ranges cleanly.
+                if active > 0:
+                    self._broadcast_abort(current_task_id)
                 if active > 0 or self._worker_count_fallback > 0:
                     count = active if active > 0 else self._worker_count_fallback
                     publish_tasks(
                         self._channel,
-                        block_index=self._current_block_index,
-                        fingerprint=self._current_fingerprint,
-                        difficulty=self._current_difficulty,
+                        block_index=current_block,
+                        fingerprint=current_fingerprint,
+                        difficulty=current_difficulty,
                         num_workers=count,
-                        range_size=self._current_nonce_space,
+                        range_size=current_nonce_space,
                         routing_key_prefix=f"pool.{self.pool_id}.task",
                     )
                     self._original_worker_count = count
@@ -383,7 +434,7 @@ class PoolCoordinator:
                         body=json.dumps({
                             "worker_id": self.pool_id,
                             "action": "pool_no_workers",
-                            "block_index": self._current_block_index,
+                            "block_index": current_block,
                             "timestamp": time.time(),
                         }, sort_keys=True),
                         properties=persistent_props(),
@@ -394,7 +445,7 @@ class PoolCoordinator:
                 logger.warning(
                     "Block %d: no result after %.0fs with %d workers still alive. "
                     "Waiting for NCT timeout + range expansion.",
-                    self._current_block_index, elapsed, active,
+                    current_block, elapsed, active,
                 )
 
     # ------------------------------------------------------------------
