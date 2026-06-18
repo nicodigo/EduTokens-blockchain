@@ -219,10 +219,20 @@ valid = (pow_hash == claimed_hash) and pow_hash.startswith("0" * difficulty)
 ### Block data model (`shared/block.py`)
 
 ```
+Transaction
+├── sender_pubkey    (str)      Ed25519 public key (64 hex chars)
+├── receiver_pubkey  (str)      Ed25519 public key (64 hex chars)
+├── amount           (float)    amount being transferred
+├── tx_type          (str)      "EARN" (university → student) or "SPEND" (student → vendor)
+├── concept          (str)      free-text (e.g. "TP1", "COMEDOR")
+├── signature        (str)      Ed25519 signature (128 hex chars) over tx_id
+└── timestamp        (float)    unix UTC
+   └── tx_id         (SHA-256)  content identifier — signature excluded
+
 Block
 ├── index           (int)      position in chain
 ├── timestamp       (float)    unix UTC
-├── transactions    (list)     list of Transaction objects
+├── transactions    (list)     list of Transaction objects (each Ed25519-signed)
 ├── previous_hash   (str)      SHA-256 of previous block (64 hex chars)
 ├── difficulty      (int)      number of leading zero nibbles for PoW
 ├── nonce           (int)      solution found by miner
@@ -230,29 +240,47 @@ Block
 
 Block.fingerprint   → SHA-256(block WITHOUT nonce)  ← sent to miners
 Block.compute_hash()→ SHA-256(block WITH nonce)     ← used for chain linking
+
+Balance index (Redis)
+├── balance:{pubkey} → float   per-student balance, updated atomically via pipeline
+└── rebuilt from chain on startup if missing (crash recovery)
 ```
 
 **Two distinct hash algorithms in use:**
 
 | Hash | Algorithm | Purpose |
 |---|---|---|
-| `fingerprint` | SHA-256 | Stable identifier sent to miners as PoW base string |
+| `tx_id` | SHA-256 | Deterministic transaction ID (signature excluded — computable before signing) |
+| `fingerprint` | SHA-256 | Stable block identifier WITHOUT nonce — sent to miners as PoW base string |
 | PoW hash | MD5 | Must start with N zeros (cheaper, good enough for demo) |
-| `block.hash` | SHA-256 | Final block ID stored in Redis, used as `previous_hash` |
+| `block.hash` | SHA-256 | Final block ID, stored in Redis, used as `previous_hash` for the next block |
+
+### Transaction validation (`shared/block.py` + `nct/nct.py`)
+
+Every transaction is validated in three layers at `POST /transaction`:
+
+1. **Structural** — pubkey lengths (64 hex), signature length (128 hex), amount > 0, tx_type ∈ {EARN, SPEND}, concept non-empty, sender ≠ receiver
+2. **Ed25519 signature** — `verify(sender_pubkey, tx_id, signature)` using the `cryptography` library; only the key holder can authorise their own spends
+3. **Authority gate** — `EARN` transactions are only accepted from the configured `AUTHORITY_PUBKEY` (the university). `SPEND` transactions have no authority restriction — any student can spend their own balance.
+
+Balance validation for `SPEND` happens at **block assembly time** via `drain_pool_validated()`, which maintains an in-memory overlay of per-student deltas during the block to prevent double-spend within a single block.
 
 ### RabbitMQ topology (`broker/broker.py`)
 
 ```
 Exchange: "blockchain" (topic, durable)
 
-Queues:
-  mining_tasks     ← bind: task.*       (work queue, prefetch=1)
-  mining_results   ← bind: result.*     (results from workers/pools)
-  worker_registry  ← bind: worker.*     (heartbeats for live worker tracking)
+Queues (fixed):
+  mining_results   ← bind: result.*     (worker/pool → NCT, single queue shared by all)
+  worker_registry  ← bind: worker.*     (heartbeats: worker_id, timestamp)
   {anon per worker}← bind: control      (abort broadcast, exclusive, auto-delete)
+
+Queues (dynamic — per pool):
+  pool.{id}.inbox  ← bind: task.mining  (fanout: every pool gets a copy of NCT's task)
+  pool.{id}.tasks  ← bind: pool.{id}.task.* (pool's own task queue for workers)
+  pool.{id}.results← bind: pool.{id}.result.* (results from pool's workers)
 ```
 
-**Pool architecture (step 2.8):**  
 NCT publishes ONE message to `task.mining`. Every pool that has bound a queue to that key gets a copy. Each pool then partitions the full nonce space among its own workers. Pools compete with each other; the first valid result wins.
 
 ### Redis persistence (`storage/chain_store.py`)
@@ -268,6 +296,10 @@ Operations:
   LLEN   → get_chain_height()
   LLEN+LINDEX → get_latest_block()
   full scan → validate_chain() verifies hash chaining integrity
+
+Balance keys:
+  GET balance:{pubkey}         → get_balance(pubkey)
+  INCRBYFLOAT (pipeline)       → update_balances_from_block()  — atomic per-block
 ```
 
 AOF persistence enabled (`--appendonly yes`) so chain survives container restarts.
@@ -285,7 +317,11 @@ AOF persistence enabled (`--appendonly yes`) so chain survives container restart
 
 Thin subprocess wrapper around the CUDA binary:
 ```python
-result = MinerService(binary_path="./md5_range").mine(
+# The binary_path is split with shlex.split() so compound commands work:
+#   binary_path = "python3 /app/miner/cpu_miner.py"  ← CPU fallback in Docker
+#   binary_path = "./md5_range"                       ← compiled CUDA binary
+
+result = MinerService(binary_path=binary_path).mine(
     base_string=fingerprint,
     target_prefix="0000",
     range_min=0,
@@ -295,6 +331,8 @@ result = MinerService(binary_path="./md5_range").mine(
 ```
 
 Parses stdout, handles timeouts and crashes. The binary is compiled from `pilar1/md5_bf_range/`.
+In Docker Compose, workers use the **CPU fallback miner** (`python3 /app/miner/cpu_miner.py`)
+so the stack runs without a GPU. The CUDA binary can be swapped in on GPU-equipped hosts.
 
 ### Docker Compose services
 
@@ -303,9 +341,12 @@ Parses stdout, handles timeouts and crashes. The binary is compiled from `pilar1
 | `redis` | redis:7-alpine | 6379 | — |
 | `rabbitmq` | rabbitmq:3-management-alpine | 5672, 15672 | — |
 | `nct` | custom (python:3.12-alpine) | 8080 | redis (healthy), rabbitmq (healthy) |
-| `pool-a` | custom | 8090 | rabbitmq (healthy) |
-| `worker-a1` | custom | 8081 | rabbitmq (healthy) |
-| `worker-a2` | custom | 8082 | rabbitmq (healthy) |
+| `pool-a` | custom (python:3.12-alpine) | 8090 | rabbitmq (healthy) |
+| `worker-a1` | custom (python:3.12-alpine) | 8081 | rabbitmq (healthy) |
+| `worker-a2` | custom (python:3.12-alpine) | 8082 | rabbitmq (healthy) |
+
+Workers use **CPU fallback miner** by default: `MINER_BINARY=python3 /app/miner/cpu_miner.py`.
+Replace with `./md5_range` (compiled CUDA binary) on GPU hosts.
 
 ### Environment variables (key ones)
 
@@ -315,9 +356,28 @@ Parses stdout, handles timeouts and crashes. The binary is compiled from `pilar1
 | NCT | `BLOCK_TIMEOUT` | 30 | Seconds to wait before expanding nonce space |
 | NCT | `DIFFICULTY` | 4 | Leading zeros required |
 | NCT | `NONCE_SPACE` | 1,000,000,000 | Initial nonce search range |
+| NCT | `AUTHORITY_PUBKEY` | — | Ed25519 pubkey authorised to issue EARN transactions |
+| NCT | `PORT` | 8080 | HTTP port |
+| Pool | `POOL_ID` | autogen | Pool identifier |
+| Pool | `POOL_WORKER_COUNT` | 2 | Fallback worker count when no heartbeats seen |
 | Worker | `MINER_BINARY` | `./md5_range` | Path to compiled CUDA binary |
 | Worker | `POOL_ID` | — | If set, worker joins a pool instead of solo mode |
+| Worker | `HEARTBEAT_INTERVAL` | 5 | Seconds between heartbeats |
+| Worker | `HEALTH_PORT` | 8081 | HTTP port |
 | All | `LOG_FILE` | — | If set, logs go to file + stdout |
+
+### NCT HTTP API (`nct/nct.py` — FastAPI + uvicorn)
+
+| Method | Route | Response |
+|---|---|---|
+| `GET` | `/health` | `{"status": "ok"}` |
+| `GET` | `/status` | `{"chain_height": N, "pending_transactions": M, "current_block": X}` |
+| `POST` | `/transaction` | `{"tx_id": "..."}` (201) or `{"error": "..."}` (400) |
+| `GET` | `/balance/{pubkey}` | `{"address": "...", "balance": 42.5}` |
+| `GET` | `/chain` | Full serialised chain as JSON array (audit trail) |
+
+`POST /transaction` validates: structural checks → Ed25519 signature verification → authority gate for EARN.
+The server is built with **FastAPI** and served via **uvicorn** in a background thread.
 
 ### Test coverage (`tests/`)
 
@@ -325,12 +385,14 @@ Parses stdout, handles timeouts and crashes. The binary is compiled from `pilar1
 
 | Test file | What it covers |
 |---|---|
-| `test_block.py` | Transaction/Block creation, serialization roundtrip, PoW verification |
+| `test_block.py` | Transaction/Block creation, serialization roundtrip, structural validation, PoW verification |
 | `test_broker.py` | Topology declaration, task partitioning, result polling, abort broadcast |
 | `test_chain_store.py` | Redis list operations, chain validation, broken-chain detection |
+| `test_crypto.py` | Ed25519 signature verification, pubkey-to-address derivation |
 | `test_health.py` | HTTP endpoints: `/health`, `/status`, 404 handling |
 | `test_miner.py` | Subprocess stdout parsing, timeout, crash, argument passing |
-| `test_nct.py` | `verify_pow_result`, `accumulate_transactions`, `handle_result`, `NCTState` |
+| `test_nct.py` | `verify_pow_result`, `accumulate_transactions`, `handle_result`, `NCTState`, `drain_pool_validated` |
+| `test_pool.py` | Pool coordinator, task fanout, result verification, dynamic worker count |
 | `test_worker.py` | Heartbeat registration, active worker counting, expiration |
 
 Run all tests:
@@ -358,7 +420,8 @@ No code has been written for Pilar 3 yet.
 ## How to Run Locally (Pilar 2)
 
 ```bash
-# Prerequisites: Docker + Docker Compose installed, CUDA binary built
+# Prerequisites: Docker + Docker Compose installed
+# (CUDA binary optional — CPU fallback miner works out of the box)
 
 # Build the CUDA miner first (requires NVIDIA GPU + CUDA toolkit, or Colab)
 cd pilar1/md5_bf_range && make
@@ -386,17 +449,21 @@ open http://localhost:15672  # guest / guest
 
 1. **MD5 for PoW, SHA-256 for chain linking** — MD5 is fast on GPU (good for demo), SHA-256 is collision-resistant (good for tamper evidence).
 
-2. **No digital signatures** — Transactions lack ECDSA signatures. The NCT acts as a trusted validator. Acknowledged shortcut vs real blockchain.
+2. **Ed25519 digital signatures** — Every transaction is signed by its sender using Ed25519 (via the `cryptography` library). The NCT verifies the signature at `POST /transaction` time. This provides non-repudiation: only the key holder can authorise a spend. The signing happens client-side (frontend, admin scripts); the blockchain never sees private keys.
 
-3. **`subprocess` for CUDA** — Python calls the compiled binary via `subprocess.run()` instead of PyCUDA. Keeps Pilar 1 (C++/CUDA) and Pilar 2 (Python) cleanly separated.
+3. **Authority model** — `EARN` transactions (university → student) are gated: only the configured `AUTHORITY_PUBKEY` can issue them. `SPEND` transactions (student → vendor) require a valid Ed25519 signature from the student. Balance validation happens at block assembly time to allow fast async POSTs.
 
-4. **Threading over asyncio** — NCT uses `threading` because the bottleneck is network I/O (RabbitMQ, Redis), not CPU. Three daemon threads share state via `NCTState` with a `threading.Lock`.
+4. **`subprocess` for CUDA** — Python calls the compiled binary via `subprocess.run()` instead of PyCUDA. Keeps Pilar 1 (C++/CUDA) and Pilar 2 (Python) cleanly separated. A CPU fallback miner (`cpu_miner.py`) ships in Docker so the stack works without a GPU.
 
-5. **Pool architecture** — NCT publishes one task (full range) per block. Pools subscribe and partition internally. This lets multiple pools compete without the NCT managing individual workers.
+5. **Threading over asyncio** — NCT uses `threading` because the bottleneck is network I/O (RabbitMQ, Redis), not CPU. Three daemon threads share state via `NCTState` with a `threading.Lock`.
 
-6. **Lazy imports in broker** — `pika` is only imported when a connection is actually needed, so the test suite runs without RabbitMQ installed.
+6. **FastAPI + uvicorn** — HTTP layer uses FastAPI with Pydantic schemas for strong request/response contracts, served by uvicorn in a background thread.
 
-7. **Deterministic serialization** — All JSON is serialized with `sort_keys=True` to ensure consistent SHA-256 hashes across Python versions and platforms.
+7. **Pool architecture** — NCT publishes one task (full range) per block to `task.mining`. Pools subscribe via topic fanout and partition internally among their workers. Worker count is dynamic (driven by heartbeats) with a configurable fallback.
+
+8. **Lazy imports in broker** — `pika` is only imported when a connection is actually needed, so the test suite runs without RabbitMQ installed.
+
+9. **Deterministic serialization** — All JSON is serialized with `sort_keys=True` to ensure consistent SHA-256 hashes across Python versions and platforms.
 
 ---
 
@@ -407,10 +474,12 @@ open http://localhost:15672  # guest / guest
 | GPU Mining | CUDA C++ (nvcc), MD5 custom implementation |
 | CPU Mining | Python 3.11+ hashlib |
 | GPU Parallelism | NVIDIA Thrust (CCCL), raw CUDA kernels |
-| Services | Python 3.12, FastAPI, uvicorn |
+| Services | Python 3.12, FastAPI + uvicorn |
 | Message Queue | RabbitMQ 3 (pika client), topic exchange |
 | Storage | Redis 7 (redis-py client), AOF persistence |
+| Signatures | Ed25519 (cryptography library) |
 | Containerization | Docker + Docker Compose |
 | Testing | Python `unittest` + `MagicMock` |
+| HTTP API | FastAPI + Pydantic (strong request/response validation) |
 | Target cloud | Google Kubernetes Engine (GKE) via OpenTofu |
 | CI/CD | GitHub Actions (planned) |

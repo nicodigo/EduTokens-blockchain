@@ -13,22 +13,25 @@ Arquitectura distribuida para una blockchain simple con Proof-of-Work usando el 
 ```python
 @dataclass
 class Transaction:
-    sender: str
-    receiver: str
-    amount: float
+    sender_pubkey: str        # Ed25519 public key (64 hex chars) del emisor
+    receiver_pubkey: str      # Ed25519 public key (64 hex chars) del receptor
+    amount: float             # monto a transferir
+    tx_type: str              # "EARN" (universidad → estudiante) o "SPEND" (estudiante → comercio)
+    concept: str              # texto libre (ej: "TP1", "COMEDOR")
+    signature: str            # firma Ed25519 (128 hex chars) sobre tx_id
     timestamp: float
 ```
 
-Cada transacción representa una transferencia de valor entre dos usuarios. Su identificador único (`tx_id`) se deriva como SHA-256 del contenido serializado, lo que garantiza determinismo e inmutabilidad.
+Cada transacción representa una transferencia de valor entre dos usuarios identificados por su clave pública Ed25519. Su identificador único (`tx_id`) se deriva como SHA-256 del *signing dict* (excluyendo la firma), lo que permite computar `tx_id` antes de firmar y luego adjuntar la firma sin cambiar el identificador.
 
 **Validaciones:**
-- `sender` y `receiver` no vacíos y distintos entre sí
+- `sender_pubkey` y `receiver_pubkey`: 64 hex chars cada uno, distintos entre sí
 - `amount` positivo
+- `tx_type` debe ser `"EARN"` o `"SPEND"`
+- `concept` no vacío
+- `signature`: 128 hex chars, verificada criptográficamente contra `sender_pubkey`
 
-**Compromiso documentado:** No se implementan firmas digitales. En una blockchain real cada transacción estaría firmada con la clave privada del emisor para garantizar autenticación no-repudiable. Esta simplificación es aceptable porque:
-1. El coordinador centralizado (NCT) valida la legitimidad de las transacciones
-2. La inmutabilidad de la cadena se garantiza mediante hash chaining + PoW
-3. Agregar PKI (ECDSA, firma, verificación) aumenta ~30% el código sin mejorar los conceptos centrales de la materia
+**Firmas digitales implementadas:** Cada transacción se firma con Ed25519 (librería `cryptography`). La verificación ocurre en `POST /transaction` en el NCT: `verify(sender_pubkey, tx_id, signature)`. Solo el dueño de la clave privada puede autorizar un gasto. Las claves privadas nunca tocan el blockchain — la firma se genera del lado del cliente (frontend, script admin).
 
 ### Decisión de diseño: Block
 
@@ -57,6 +60,7 @@ El bloque utiliza dos valores hash con roles distintos:
 - `previous_hash = "0" * 64` (sin bloque anterior real)
 - Sin transacciones
 - Sin PoW (difficulty=0, nonce=0)
+- `hash` se computa con `compute_hash()` (SHA-256 del bloque completo sin nonce — para génesis esto es SHA-256 del dict sin nonce, que da un valor fijo)
 
 ### Serialización
 
@@ -68,7 +72,8 @@ Archivo: `tests/test_block.py`
 
 Los tests cubren:
 - Creación y validación del bloque génesis
-- Creación de transacciones y cálculo determinista de `tx_id`
+- Creación de transacciones con pubkeys Ed25519 y cálculo determinista de `tx_id`
+- Validación estructural de transacciones (campos requeridos, longitudes, tx_type)
 - Serialización/deserialización (roundtrip)
 - Validación estructural de bloques (encadenamiento correcto e incorrecto)
 - Verificación de PoW (rechazo de nonces que no cumplen la dificultad)
@@ -88,7 +93,9 @@ cd pilar2 && python3 -m unittest tests/test_block.py -v
 El binario CUDA del Pilar 1 (`md5_range`) es un programa CLI que recibe argumentos, mina, imprime el resultado, y termina. Para integrarlo en un sistema distribuido necesitamos un wrapper que lo encapsule como un servicio llamable desde Python.
 
 ```python
-svc = MinerService(binary_path="./md5_range", timeout_seconds=300)
+svc = MinerService(binary_path="./md5_range", timeout_seconds=300)  # CUDA real
+# o bien:
+svc = MinerService(binary_path="python3 /app/miner/cpu_miner.py")    # CPU fallback (Docker)
 result = svc.mine(block_fingerprint, "0000", 0, 10_000_000)
 # → MinerResult(nonce=10941, hash="0000b8d7...") | None
 ```
@@ -99,6 +106,8 @@ result = svc.mine(block_fingerprint, "0000", 0, 10_000_000)
 - Reimplementar MD5 + grid-stride loop en Python con PyCUDA duplicaría esfuerzo
 - El binario compilado con `nvcc` tiene overhead de inicialización de ~0.4s; el subprocess paga ese costo una vez por tarea, lo cual es aceptable para dificultades ≥ 4
 - Mantiene separación clara de responsabilidades: Pilar 1 = computación GPU, Pilar 2 = distribución
+
+El `binary_path` se parsea con `shlex.split()` para soportar comandos compuestos como `"python3 /app/miner/cpu_miner.py"`. Esto permite que en Docker (sin GPU) los workers usen el minero CPU de respaldo, y en hosts con GPU se use el binario CUDA compilado sin cambiar una línea de código.
 
 ### Integración con el flujo de minado
 
@@ -120,7 +129,7 @@ Coordinador (NCT)                Worker (MinerService)
      │◀─────────────────────────────────┤
 ```
 
-La comunicación provisional es una llamada directa a `MinerService.mine()`. En el paso 2.4 esta función se conecta a una cola de RabbitMQ sin cambiar su interfaz.
+El worker invoca `MinerService.mine()` directamente. El servicio maneja timeouts, crashes del binario, y parsea la salida stdout con regex. Si el minero no encuentra solución en el rango, retorna `None` (no es error — el pool/NCT expande el rango y reintenta).
 
 ### Tests
 
@@ -168,7 +177,7 @@ cd pilar2 && docker compose up -d
 
 ### Módulo chain_store
 
-Archivo: `pilar2/storage/chain_store.py`
+Archivos: `pilar2/storage/chain_store.py`, `pilar2/shared/crypto.py`
 
 API de persistencia contra Redis:
 
@@ -179,13 +188,18 @@ API de persistencia contra Redis:
 | `get_latest_block(client)` | `LLEN` + `LINDEX` | Último bloque minado |
 | `get_chain_height(client)` | `LLEN` | Cantidad de bloques en la cadena |
 | `validate_chain(client)` | Itera toda la lista | Valida integridad estructural de cada bloque |
+| `get_balance(client, pubkey)` | `GET balance:{pubkey}` | Saldo confirmado para una clave pública |
+| `update_balances_from_block(client, block)` | Pipeline INCRBYFLOAT | Actualiza saldos atómicamente por bloque |
+| `rebuild_balances_from_chain(client)` | Reconstrucción completa | Recuperación tras crash entre save_block y update_balances |
 
 **Estructura en Redis:**
 ```
 blockchain:blocks  →  List  →  [JSON(block0), JSON(block1), ...]
+balance:{pubkey}   →  String → saldo acumulado (float)
 ```
 
 La cadena se modela como una Redis List — append-only, ordenada, y atómica. Cada elemento es un bloque serializado a JSON con `sort_keys=True` (determinístico).
+El índice de saldos es una cache derivada: se actualiza con pipeline al minar cada bloque, y se reconstruye desde cero al iniciar si la cadena existe pero el índice está vacío (recuperación de crash).
 
 **Conexión:** `connect()` lee `REDIS_URL` del entorno (default `redis://localhost:6379`). El import de `redis-py` es lazy — solo se carga al llamar a `connect()`, no al importar el módulo. Esto permite correr los tests unitarios sin Redis instalado.
 
@@ -291,6 +305,10 @@ Los tests cubren:
 
 ## 2.5 — Nodo Coordinador (NCT)
 
+### Stack HTTP
+
+El NCT expone su API via **FastAPI + uvicorn** (schemas Pydantic, validación fuerte de requests/responses). FastAPI corre en un thread daemon — mismo modelo de threading, contratos más limpios.
+
 ### Arquitectura de threads
 
 El NCT ejecuta tres loops concurrentes con `threading`:
@@ -315,18 +333,25 @@ El estado compartido se maneja con `NCTState`:
 
 ```
 accumulate_transactions()           ← espera BLOCK_SIZE txs o BLOCK_TIMEOUT
-    │
+     │
+drain_pool_validated()              ← valida saldos SPEND (overlay intra-bloque)
+     │
 create_block(index, txs, prev_hash)
-    │
+     │
 fingerprint = block.fingerprint     ← SHA-256 sin nonce
-    │
-publish_tasks(N ranges)
-    │
+     │
+publish_mining_task(full range)     ← un solo mensaje a task.mining (fanout)
+     │
 block_mined.wait(timeout)           ← espera resultado del result loop
-    │
-    ├── mined → log, next block
-    └── timeout → nonce_space × 2, republicar, volver a esperar
+     │
+     ├── mined → log, next block
+     └── timeout → nonce_space × 2, republicar, volver a esperar
 ```
+
+`drain_pool_validated()` mantiene un *overlay* en memoria de deltas por estudiante durante el ensamblado del bloque. Esto previene double-spend dentro de un mismo bloque sin requerir chequeos síncronos de saldo en cada POST:
+- **EARN**: siempre aceptado (ya pasó validación estructural y de autoridad en POST)
+- **SPEND**: aceptado solo si `confirmed_balance + overlay_delta >= amount`
+- Transacciones descartadas por saldo insuficiente **no** vuelven al pool — el cliente debe reenviar
 
 ### Verificación de PoW
 
@@ -336,6 +361,16 @@ Dos chequeos independientes en `handle_result()`:
 2. `result.hash.startswith("0" * difficulty)` (dificultad)
 
 El `result.hash` es el MD5 (32 chars) del PoW. El `block.hash` (SHA-256, 64 chars) se computa **después** con `block.compute_hash()` y se usa para encadenamiento.
+
+### Validación de transacciones en POST /transaction
+
+Tres capas de validación al recibir una transacción:
+
+1. **Estructural** — `Transaction.validate()`: longitudes de pubkey (64 hex), firma (128 hex), amount > 0, tx_type ∈ {EARN, SPEND}, concept no vacío, sender ≠ receiver
+2. **Firma Ed25519** — `crypto.verify(sender_pubkey, tx_id.encode(), signature)` usando la librería `cryptography`. Solo el dueño de la clave privada puede autorizar un gasto.
+3. **Autoridad** — Solo `AUTHORITY_PUBKEY` puede emitir EARN. Si no está configurada, todos los EARN se rechazan. SPEND no tiene restricción de autoridad — cualquier estudiante puede gastar su propio saldo.
+
+La validación de saldo para SPEND **no** ocurre en el POST — se difiere al momento de ensamblar el bloque (`drain_pool_validated`). Esto permite POSTs asíncronos rápidos sin bloqueos por consultas a Redis.
 
 ### Filtro de resultados stale
 
@@ -347,9 +382,11 @@ Si llega un resultado para un bloque que ya fue minado (otro worker encontró la
 |---|---|---|
 | `GET` | `/health` | `{"status": "ok"}` |
 | `GET` | `/status` | `{"chain_height": N, "pending_transactions": M, "current_block": X}` |
-| `POST` | `/transaction` | `{"tx_id": "..."}` (body: `{"sender", "receiver", "amount"}`) |
+| `GET` | `/balance/{pubkey}` | `{"address": "...", "balance": 42.5}` |
+| `GET` | `/chain` | Cadena completa serializada (audit trail) |
+| `POST` | `/transaction` | `{"tx_id": "..."}` (body con `sender_pubkey`, `receiver_pubkey`, `amount`, `tx_type`, `concept`, `signature`) |
 
-Implementado con `http.server` de stdlib — sin dependencias extra.
+Implementado con **FastAPI + uvicorn** usando schemas Pydantic para validación fuerte de requests/responses.
 
 ### Configuración
 
@@ -359,7 +396,8 @@ Variables de entorno (archivo `nct/.env`):
 |---|---|---|
 | `REDIS_URL` | `redis://localhost:6379` | Conexión a Redis |
 | `RABBITMQ_URL` | `amqp://localhost:5672/` | Conexión a RabbitMQ |
-| `WORKER_COUNT` | `2` | Cantidad de workers (fijo en 2.5) |
+| `AUTHORITY_PUBKEY` | — | Clave pública Ed25519 autorizada para emitir EARN |
+| `HEARTBEAT_TIMEOUT` | `15.0` | Segundos sin heartbeat para considerar worker caído |
 | `BLOCK_SIZE` | `5` | Transacciones por bloque |
 | `BLOCK_TIMEOUT` | `30` | Segundos máx. esperando transacciones |
 | `DIFFICULTY` | `4` | Ceros requeridos en PoW |
@@ -422,7 +460,9 @@ Configuración (`worker/.env`):
 | `WORKER_ID` | `worker-{uuid}` | Identificador único |
 | `RABBITMQ_URL` | `amqp://localhost:5672/` | Conexión a RabbitMQ |
 | `MINER_BINARY` | `./md5_range` | Path al binario CUDA |
+| `POOL_ID` | — | Si está definido, el worker se une a un pool |
 | `HEARTBEAT_INTERVAL` | `5` | Segundos entre heartbeats |
+| `HEALTH_PORT` | `8081` | Puerto HTTP |
 
 ### Keep-alive (registro dinámico)
 
@@ -478,11 +518,12 @@ Los tests cubren:
 
 ### Endpoints de salud para cada servicio
 
-Cada servicio expone un endpoint HTTP mínimo con `http.server` (stdlib, sin dependencias):
+Cada servicio expone un endpoint HTTP con **FastAPI + uvicorn** (schemas Pydantic, validación fuerte):
 
 | Servicio | Puerto | Endpoints |
 |---|---|---|
-| NCT | `8080` | `GET /health`, `GET /status`, `POST /transaction` |
+| NCT | `8080` | `GET /health`, `GET /status`, `POST /transaction`, `GET /balance/{pubkey}`, `GET /chain` |
+| Pool | `8090` (configurable) | `GET /health` |
 | Worker | `8081` (configurable) | `GET /health`, `GET /status` |
 | Redis | `6379` | Healthcheck interno (Docker) |
 | RabbitMQ | `15672` | Management UI + healthcheck interno (Docker) |
@@ -490,8 +531,9 @@ Cada servicio expone un endpoint HTTP mínimo con `http.server` (stdlib, sin dep
 **Respuestas:**
 
 ```
-GET /health → {"status": "ok", "worker_id": "worker-1", "uptime_seconds": 42.3}
-GET /status → {"worker_id": "worker-1", "current_task": "...", "tasks_processed": 5, ...}
+GET /health → {"status": "ok"}
+GET /health (worker) → {"status": "ok", "worker_id": "worker-a1", "uptime_seconds": 42.3}
+GET /status (worker) → {"worker_id": "worker-a1", "current_task": "...", "tasks_processed": 5, "uptime_seconds": 42.3}
 ```
 
 Los workers se identifican con `WORKER_ID` (env var) o un UUID autogenerado. Esto permite distinguir instancias en los logs y en el panel de RabbitMQ.
@@ -523,14 +565,15 @@ La consigna menciona observabilidad (U5.5) pero para el alcance del TP:
 El compose ahora expone puertos de health para todos los servicios Python:
 
 ```
-nct       → :8080  (health + transaction API)
-worker-1  → :8081  (health)
-worker-2  → :8082  (health)
+nct       → :8080  (health + transaction API + balance + chain)
+pool-a    → :8090  (health)
+worker-a1 → :8081  (health + status)
+worker-a2 → :8082  (health + status)
 redis     → :6379
 rabbitmq  → :5672 (AMQP) + :15672 (Management UI)
 ```
 
-Cada worker es un servicio independiente con su propio `WORKER_ID`, `HEALTH_PORT` y `LOG_FILE`. Esto permite verificar cada instancia individualmente.
+Cada worker es un servicio independiente con su propio `WORKER_ID`, `POOL_ID`, `HEALTH_PORT` y `LOG_FILE`. Los workers usan el **CPU fallback miner** (`python3 /app/miner/cpu_miner.py`) por defecto en Docker.
 
 ### Tests
 
@@ -557,7 +600,7 @@ El NCT ya no particiona el nonce space. Publica **un solo mensaje** con el rango
 ```
 NCT ──task.mining──▶ Exchange: blockchain (topic)
                        │
-                       ├──▶ pool-a.inbox ──▶ Pool A particiona → 2 workers
+                       ├──▶ pool-a.inbox ──▶ Pool A particiona → N workers (dinámico vía heartbeats)
                        ├──▶ pool-b.inbox ──▶ Pool B particiona → 3 workers
                        └──▶ worker-x.inbox ──▶ Solo miner (sin pool)
 ```
@@ -571,7 +614,8 @@ Archivo: `pilar2/pool/pool.py`
 | Responsabilidad | Detalle |
 |---|---|
 | Consumir tareas | Cola `pool.{POOL_ID}.inbox` bindeada a `task.mining` |
-| Particionar | Divide el rango completo en `POOL_WORKER_COUNT` subrangos |
+| Workers dinámicos | Escucha heartbeats en `worker.{pool_id}.*`; si no hay datos aún, usa `POOL_WORKER_COUNT` como fallback |
+| Particionar | Divide el rango completo entre sus N workers activos |
 | Distribuir | Publica a `pool.{POOL_ID}.tasks` (cola de sus workers) |
 | Recolectar | Consume de `pool.{POOL_ID}.results` |
 | Verificar | Comprueba PoW localmente antes de reenviar al NCT |
@@ -593,7 +637,7 @@ Cuando el worker tiene `POOL_ID=pumpkin`, adapta su comportamiento:
 
 ```
 nct (:8080)      — coordinator, publica 1 tarea por bloque
-pool-a (:8090)   — pool coordinator, particiona para 2 workers
+pool-a (:8090)   — pool coordinator, workers dinámicos vía heartbeats
 worker-a1 (:8081) — minero del pool-a
 worker-a2 (:8082) — minero del pool-a
 ```
