@@ -68,13 +68,56 @@ def connect() -> "Redis":
 
 
 def save_block(client: Any, block: Block) -> None:
-    """Append *block* to the end of the chain.
+    """Append *block* to the end of the chain (non-atomic).
+
+    Prefer :func:`save_block_atomic` for production use — it persists the
+    block, balances, and nonces in a single Redis transaction.
 
     The caller is responsible for ensuring the block is valid and
     correctly chained to the previous block.
     """
     payload = json.dumps(block.to_dict(), sort_keys=True)
     client.rpush(BLOCKS_KEY, payload)
+
+
+def save_block_atomic(client: Any, block: Block) -> None:
+    """Append *block* and update balances/nonces in one Redis transaction.
+
+    Uses a ``MULTI/EXEC`` pipeline so the block, all balance changes, and
+    all nonce updates are persisted atomically.  A crash between individual
+    operations cannot leave the chain with a stored block but stale indexes
+    (audit H3, M4).
+
+    This is the recommended production path for ``handle_result``.
+    :func:`save_block` is still available for genesis creation and other
+    single-block operations that don't require balance updates.
+    """
+    payload = json.dumps(block.to_dict(), sort_keys=True)
+    pipe = client.pipeline(transaction=True)
+
+    # 1. Append the block JSON to the chain list
+    pipe.rpush(BLOCKS_KEY, payload)
+
+    # 2. Update balances for every transaction in the block
+    for tx in block.transactions:
+        if tx.tx_type == "EARN":
+            pipe.incrby(f"{BALANCE_PREFIX}{tx.receiver_pubkey}", tx.amount)
+        elif tx.tx_type == "SPEND":
+            pipe.incrby(f"{BALANCE_PREFIX}{tx.sender_pubkey}", -tx.amount)
+
+    # 3. Advance nonces for every sender
+    for tx in block.transactions:
+        pipe.set(f"{NONCE_PREFIX}{tx.sender_pubkey}", tx.nonce + 1)
+
+    pipe.execute()
+
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.debug(
+        "Block %d persisted atomically with %d balance/nonce updates",
+        block.index,
+        len(block.transactions) * 2,  # one balance + one nonce per tx
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -135,13 +178,13 @@ def validate_chain(client: Any) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def get_balance(client: Any, address: str) -> float:
-    """Return the confirmed balance for *address*, or ``0.0`` if no entry exists.
+def get_balance(client: Any, address: str) -> int:
+    """Return the confirmed balance for *address*, or ``0`` if no entry exists.
 
     *address* is the public key (64 hex chars) of the account holder.
     """
     val = client.get(f"{BALANCE_PREFIX}{address}")
-    return float(val) if val is not None else 0.0
+    return int(val) if val is not None else 0
 
 
 # ---------------------------------------------------------------------------
@@ -155,8 +198,12 @@ def get_nonce(client: Any, pubkey: str) -> int:
     return int(val) if val is not None else 0
 
 
-def _set_nonce(client: Any, pubkey: str, nonce: int) -> None:
-    """Set the nonce for *pubkey* (used during rebuild)."""
+def set_nonce(client: Any, pubkey: str, nonce: int) -> None:
+    """Set the nonce for *pubkey* directly.
+
+    Used during state rebuild.  In normal operation nonces are updated
+    through :func:`save_block_atomic` or :func:`update_nonces_from_block`.
+    """
     client.set(f"{NONCE_PREFIX}{pubkey}", nonce)
 
 
@@ -177,7 +224,7 @@ def update_balances_from_block(client: Any, block: Block) -> None:
     """Atomically update the balance index for every transaction in *block*.
 
     Called from ``handle_result`` immediately after ``save_block``.
-    Uses a Redis pipeline so all INCRBYFLOAT commands are sent in one
+    Uses a Redis pipeline so all INCRBY commands are sent in one
     round-trip.  Not transactional across the full block (documented
     limitation).
 
@@ -188,9 +235,9 @@ def update_balances_from_block(client: Any, block: Block) -> None:
     pipe = client.pipeline()
     for tx in block.transactions:
         if tx.tx_type == "EARN":
-            pipe.incrbyfloat(f"{BALANCE_PREFIX}{tx.receiver_pubkey}", tx.amount)
+            pipe.incrby(f"{BALANCE_PREFIX}{tx.receiver_pubkey}", tx.amount)
         elif tx.tx_type == "SPEND":
-            pipe.incrbyfloat(f"{BALANCE_PREFIX}{tx.sender_pubkey}", -tx.amount)
+            pipe.incrby(f"{BALANCE_PREFIX}{tx.sender_pubkey}", -tx.amount)
     pipe.execute()
 
 
@@ -213,11 +260,11 @@ def rebuild_state_from_chain(client: Any) -> None:
             continue
         for tx in block.transactions:
             if tx.tx_type == "EARN":
-                client.incrbyfloat(f"{BALANCE_PREFIX}{tx.receiver_pubkey}", tx.amount)
+                client.incrby(f"{BALANCE_PREFIX}{tx.receiver_pubkey}", tx.amount)
             elif tx.tx_type == "SPEND":
-                client.incrbyfloat(f"{BALANCE_PREFIX}{tx.sender_pubkey}", -tx.amount)
+                client.incrby(f"{BALANCE_PREFIX}{tx.sender_pubkey}", -tx.amount)
             # Nonce: set to tx.nonce + 1 (last writer wins per sender)
-            _set_nonce(client, tx.sender_pubkey, tx.nonce + 1)
+            set_nonce(client, tx.sender_pubkey, tx.nonce + 1)
 
     logger.info("State rebuilt")
 

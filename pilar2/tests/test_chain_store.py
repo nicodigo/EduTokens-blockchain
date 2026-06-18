@@ -11,6 +11,7 @@ from storage.chain_store import (
     get_chain_height,
     get_latest_block,
     save_block,
+    save_block_atomic,
     validate_chain,
 )
 from tests._crypto_fixtures import make_keypair, sign
@@ -25,7 +26,7 @@ def _genesis() -> Block:
 
 
 def _make_earn_tx(receiver_pub: str, authority_priv: str, authority_pub: str,
-                  amount: float = 10.0, concept: str = "TP1") -> Transaction:
+                  amount: int = 10, concept: str = "TP1") -> Transaction:
     tx = Transaction(
         sender_pubkey=authority_pub,
         receiver_pubkey=receiver_pub,
@@ -39,6 +40,8 @@ def _make_earn_tx(receiver_pub: str, authority_priv: str, authority_pub: str,
 
 
 def _block1(genesis_hash: str, student_pub: str, uni_priv: str, uni_pub: str) -> Block:
+    import hashlib
+
     tx = _make_earn_tx(student_pub, uni_priv, uni_pub)
     b = Block(
         index=1,
@@ -46,8 +49,19 @@ def _block1(genesis_hash: str, student_pub: str, uni_priv: str, uni_pub: str) ->
         transactions=[tx],
         previous_hash=genesis_hash,
         difficulty=4,
-        nonce=42,
+        nonce=0,
     )
+    b.hash = b.compute_hash()
+
+    # Mine the block so PoW validation passes
+    fingerprint = b.fingerprint
+    nonce = 0
+    while nonce < 10_000_000:
+        digest = hashlib.md5((fingerprint + str(nonce)).encode()).hexdigest()
+        if digest.startswith("0000"):
+            break
+        nonce += 1
+    b.nonce = nonce
     b.hash = b.compute_hash()
     return b
 
@@ -167,7 +181,7 @@ class TestChainValidation(unittest.TestCase):
     def test_validate_detects_broken_chain(self):
         genesis = _genesis()
         tx = _make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub,
-                           amount=1.0)
+                           amount=1)
         # Deliberately wrong previous_hash
         bad_block = Block(
             index=1,
@@ -196,6 +210,114 @@ class TestChainValidation(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["index"], 1)
         self.assertTrue(any("previous_hash" in e for e in errors[0]["errors"]))
+
+
+# ---------------------------------------------------------------------------
+# save_block_atomic  (audit H3, M4)
+# ---------------------------------------------------------------------------
+
+
+class TestSaveBlockAtomic(unittest.TestCase):
+    """Verify that save_block_atomic uses a transactional pipeline."""
+
+    def setUp(self):
+        self.student_priv, self.student_pub, _ = make_keypair()
+        self.uni_priv, self.uni_pub, _ = make_keypair()
+        self.vendor_priv, self.vendor_pub, _ = make_keypair()
+
+    def test_uses_transactional_pipeline(self):
+        """save_block_atomic must open pipeline(transaction=True)."""
+        client = MagicMock()
+        genesis = _genesis()
+        # Genesis has no transactions — still must be transactional
+        save_block_atomic(client, genesis)
+
+        client.pipeline.assert_called_once_with(transaction=True)
+        pipe = client.pipeline.return_value
+        pipe.rpush.assert_called_once()
+        pipe.execute.assert_called_once()
+
+    def test_persists_block_and_updates_balances_and_nonces(self):
+        """A block with EARN + SPEND must rpush + incrby + set."""
+        client = MagicMock()
+        genesis = _genesis()
+
+        earn = _make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub,
+                             amount=10, concept="TP1")
+        spend = Transaction(
+            sender_pubkey=self.student_pub,
+            receiver_pubkey=self.vendor_pub,
+            amount=5,
+            tx_type="SPEND",
+            concept="COMEDOR",
+            timestamp=2000.0,
+            nonce=1,
+        )
+        spend.signature = sign(self.student_priv, spend.tx_id.encode())
+
+        block = Block(
+            index=1, timestamp=2000.0, transactions=[earn, spend],
+            previous_hash=genesis.hash, difficulty=4, nonce=0,
+        )
+        block.hash = block.compute_hash()
+
+        save_block_atomic(client, block)
+
+        pipe = client.pipeline.return_value
+
+        # rpush with block JSON
+        pipe.rpush.assert_called_once()
+        rpush_args = pipe.rpush.call_args[0]
+        self.assertEqual(rpush_args[0], BLOCKS_KEY)
+        block_dict = json.loads(rpush_args[1])
+        self.assertEqual(block_dict["index"], 1)
+        self.assertEqual(len(block_dict["transactions"]), 2)
+
+        # EARN → incrby(receiver, +10)
+        pipe.incrby.assert_any_call(
+            f"balance:{self.student_pub}", 10,
+        )
+        # SPEND → incrby(sender, -5)
+        pipe.incrby.assert_any_call(
+            f"balance:{self.student_pub}", -5,
+        )
+
+        # Nonces: both senders get set
+        pipe.set.assert_any_call(
+            f"nonce:{self.uni_pub}", 1,  # EARN sender nonce 0 + 1
+        )
+        pipe.set.assert_any_call(
+            f"nonce:{self.student_pub}", 2,  # SPEND sender nonce 1 + 1
+        )
+
+        pipe.execute.assert_called_once()
+
+    def test_atomicity_crash_between_operations_does_not_persist_partial(self):
+        """If execute() fails, nothing should be persisted.
+
+        Since save_block_atomic uses MULTI/EXEC, a crash between the
+        Python calls (before execute) doesn't matter — nothing is sent
+        to Redis yet.  We simulate this by making execute() raise.
+        """
+        client = MagicMock()
+        client.pipeline.return_value.execute.side_effect = ConnectionError("boom")
+
+        genesis = _genesis()
+        earn = _make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub,
+                             amount=10)
+        block = Block(
+            index=1, timestamp=2000.0, transactions=[earn],
+            previous_hash=genesis.hash, difficulty=4, nonce=0,
+        )
+        block.hash = block.compute_hash()
+
+        with self.assertRaises(ConnectionError):
+            save_block_atomic(client, block)
+
+        # The pipeline was created but execute() failed → no side effects
+        # (In real Redis, MULTI commands are queued, not executed until EXEC)
+        client.pipeline.assert_called_once_with(transaction=True)
+        client.pipeline.return_value.execute.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -61,7 +61,11 @@ def verify(public_key_hex: str, message: bytes, signature_hex: str) -> bool:
         Ed25519PublicKey,
     )
 
-    pubkey = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex))
+    try:
+        pubkey = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex))
+    except ValueError:
+        return False  # invalid curve point → treat as failed verification
+
     sig = bytes.fromhex(signature_hex)
 
     try:
@@ -76,10 +80,20 @@ def pubkey_to_address(public_key_hex: str) -> str:
 
     Computes ``SHA-256(public_key_raw)[:12]`` → 24 hex chars.
 
-    The address is a deterministic, collision-resistant shorthand that
-    is used as the Redis balance key and in API responses.  Losing 12
-    bytes of the 32-byte SHA-256 gives 96 bits of address space —
-    plenty for this proof-of-concept.
+    The address is a deterministic, collision-resistant shorthand used
+    as the Redis balance key and in API responses.
+
+    **Address-space trade-off:**  Using only the first 12 bytes of the
+    32-byte SHA-256 hash yields a 96-bit address.  By the birthday bound,
+    an attacker would need to generate ~2^48 keys (≈ 281 trillion) to
+    have a 50% chance of finding a collision.  This is acceptable for a
+    proof-of-concept with < 10^6 students.
+
+    **Production consideration:**  For production deployment, consider:
+    - Using the **last** 20 bytes (like Ethereum addresses) → 160 bits,
+      ``hexdigest()[-40:]``, for familiarity with existing tooling.
+    - Using the full 32-byte SHA-256 output → 256 bits, eliminating the
+      collision risk entirely at the cost of longer addresses.
     """
     _validate_hex(public_key_hex, ED25519_PUBKEY_HEX_LEN, "public_key")
     raw = bytes.fromhex(public_key_hex)

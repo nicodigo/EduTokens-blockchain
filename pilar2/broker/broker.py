@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Callable, Optional
+from typing import Any
 
 from .messages import ControlMessage, ResultMessage, TaskMessage
 
@@ -21,10 +21,99 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 EXCHANGE = "blockchain"
-TASKS_QUEUE = "mining_tasks"
 RESULTS_QUEUE = "mining_results"
 WORKER_REGISTRY_QUEUE = "worker_registry"
 CONTROL_ROUTING_KEY = "control"
+
+# ---------------------------------------------------------------------------
+# Persistent message helper (audit H1)
+# ---------------------------------------------------------------------------
+
+_PERSISTENT_PROPS: Any = None
+
+
+def persistent_props() -> Any:
+    """Return ``pika.BasicProperties(delivery_mode=2)`` for message durability.
+
+    Setting ``delivery_mode=2`` makes messages survive RabbitMQ restarts
+    when published to durable queues.  Without it, messages are transient
+    and are lost if the broker restarts, even with durable queues.
+
+    The ``pika`` import and the instance are cached at module level so
+    repeated calls do not re-import or re-allocate.
+    """
+    global _PERSISTENT_PROPS
+    if _PERSISTENT_PROPS is None:
+        import pika  # type: ignore[import-untyped]
+        _PERSISTENT_PROPS = pika.BasicProperties(delivery_mode=2)
+    return _PERSISTENT_PROPS
+
+
+# Re-exported for convenience (pool, worker)
+__all__: list[str] = []
+
+
+# ---------------------------------------------------------------------------
+# Reconnection helpers (audit H2)
+# ---------------------------------------------------------------------------
+
+_RECONNECT_MAX_RETRIES = int(os.getenv("RABBITMQ_RECONNECT_MAX_RETRIES", "20"))
+_RECONNECT_BASE_DELAY = float(os.getenv("RABBITMQ_RECONNECT_BASE_DELAY", "1.0"))
+_RECONNECT_MAX_DELAY = float(os.getenv("RABBITMQ_RECONNECT_MAX_DELAY", "30.0"))
+
+
+def is_recoverable_rabbitmq_error(exc: BaseException) -> bool:
+    """Return ``True`` for transient RabbitMQ errors worth retrying."""
+    name = type(exc).__name__
+    return any(term in name for term in (
+        "ConnectionClosed", "StreamLostError", "ChannelClosed",
+        "AMQPConnectionError", "ConnectionError", "ChannelError",
+        "TimeoutError",
+    ))
+
+
+def reconnect_rabbitmq(
+    rmq_url: str,
+    max_retries: int = _RECONNECT_MAX_RETRIES,
+    base_delay: float = _RECONNECT_BASE_DELAY,
+    max_delay: float = _RECONNECT_MAX_DELAY,
+) -> tuple[Any, Any]:
+    """Return a fresh ``(connection, channel)`` pair with topology declared.
+
+    Retries with exponential backoff on transient errors.
+    """
+    for attempt in range(max_retries):
+        try:
+            conn = get_connection(url=rmq_url)
+            ch = conn.channel()
+            declare_topology(ch)
+            if attempt > 0:
+                logger.info("Reconnected to RabbitMQ (attempt %d/%d)", attempt + 1, max_retries)
+            return conn, ch
+        except Exception as exc:
+            if not is_recoverable_rabbitmq_error(exc):
+                raise
+            delay = min(base_delay * (2 ** attempt), max_delay)
+            logger.warning(
+                "RabbitMQ reconnect attempt %d/%d failed: %s. Retrying in %.1fs…",
+                attempt + 1, max_retries, exc, delay,
+            )
+            time.sleep(delay)
+
+    raise ConnectionError(
+        f"Failed to reconnect to RabbitMQ at {rmq_url} after {max_retries} attempts"
+    )
+
+
+def _on_return(
+    _channel: Any, method: Any, _properties: Any, body: bytes,
+) -> None:
+    """Log messages returned by RabbitMQ when no queue is bound (audit L1)."""
+    logger.warning(
+        "Message returned: routing_key=%s reply_code=%s reply_text=%s body=%.200s",
+        method.routing_key, method.reply_code, method.reply_text, body,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Connection
@@ -93,6 +182,9 @@ def declare_topology(channel: Any) -> None:
     channel.queue_declare(queue=WORKER_REGISTRY_QUEUE, durable=True)
     channel.queue_bind(exchange=EXCHANGE, queue=WORKER_REGISTRY_QUEUE, routing_key="worker.*")
 
+    # Audit L1: log returned messages (mandatory=True publishes with no binding)
+    channel.add_on_return_callback(_on_return)
+
 
 # ---------------------------------------------------------------------------
 # Coordinator (NCT) helpers
@@ -104,9 +196,9 @@ def publish_tasks(
     block_index: int,
     fingerprint: str,
     difficulty: int,
+    routing_key_prefix: str,
     num_workers: int = 3,
     range_size: int = 1_000_000_000,
-    routing_key_prefix: str = "task",
 ) -> list[TaskMessage]:
     """Partition the nonce space and publish one task per partition.
 
@@ -133,6 +225,8 @@ def publish_tasks(
             exchange=EXCHANGE,
             routing_key=f"{routing_key_prefix}.{i}",
             body=task.to_json(),
+            properties=persistent_props(),
+            mandatory=True,
         )
 
     logger.info(
@@ -165,6 +259,8 @@ def publish_mining_task(
         exchange=EXCHANGE,
         routing_key="task.mining",
         body=task.to_json(),
+        properties=persistent_props(),
+        mandatory=True,
     )
     logger.info("Published mining task for block %d (range=[0, %d])", block_index, range_size)
     return task
@@ -181,32 +277,6 @@ def declare_consumer_queue(channel: Any, queue_name: str, routing_key: str) -> N
     logger.info("Declared consumer queue %s (bind: %s)", queue_name, routing_key)
 
 
-def consume_result(
-    channel: Any,
-    timeout_seconds: float = 300.0,
-    poll_interval: float = 0.1,
-) -> ResultMessage | None:
-    """Poll the results queue until a valid result arrives or timeout.
-
-    Uses ``basic_get`` (polling) instead of ``basic_consume`` so the
-    caller remains synchronous.  Suitable for the single-threaded NCT.
-    """
-    deadline = time.time() + timeout_seconds
-
-    while time.time() < deadline:
-        method, _properties, body = channel.basic_get(
-            queue=RESULTS_QUEUE, auto_ack=True
-        )
-        if method and body:
-            result = ResultMessage.from_json(body)
-            logger.info("Received result: worker=%s nonce=%d", result.worker_id, result.nonce)
-            return result
-        time.sleep(poll_interval)
-
-    logger.warning("No result received within %ds", timeout_seconds)
-    return None
-
-
 def broadcast_abort(channel: Any, task_id: str) -> None:
     """Publish an abort signal so all workers stop searching for *task_id*."""
     msg = ControlMessage(action="abort", task_id=task_id)
@@ -214,93 +284,7 @@ def broadcast_abort(channel: Any, task_id: str) -> None:
         exchange=EXCHANGE,
         routing_key=CONTROL_ROUTING_KEY,
         body=msg.to_json(),
+        properties=persistent_props(),
+        mandatory=True,
     )
     logger.info("Broadcast abort for task %s", task_id)
-
-
-# ---------------------------------------------------------------------------
-# Worker helpers
-# ---------------------------------------------------------------------------
-
-
-def setup_control_listener(
-    channel: Any,
-    on_control: Callable[[ControlMessage], None],
-) -> str:
-    """Create an anonymous auto-delete queue bound to the control routing key.
-
-    Returns the queue name (useful for debugging).
-    """
-    result = channel.queue_declare(queue="", exclusive=True, auto_delete=True)
-    queue_name: str = result.method.queue
-    channel.queue_bind(exchange=EXCHANGE, queue=queue_name, routing_key=CONTROL_ROUTING_KEY)
-
-    channel.basic_consume(
-        queue=queue_name,
-        on_message_callback=_make_control_callback(on_control),
-        auto_ack=True,
-    )
-    logger.info("Control listener set up on queue %s", queue_name)
-    return queue_name
-
-
-def start_consuming_tasks(
-    channel: Any,
-    on_task: Callable[[TaskMessage], None],
-) -> None:
-    """Bind to the shared work queue and block forever, processing tasks.
-
-    ``prefetch_count=1`` ensures the worker only gets one task at a time,
-    so it finishes (or aborts) before receiving the next one.
-    """
-    channel.basic_qos(prefetch_count=1)
-    channel.basic_consume(
-        queue=TASKS_QUEUE,
-        on_message_callback=_make_task_callback(on_task),
-        auto_ack=False,  # manual ack after successful processing
-    )
-    logger.info("Worker started consuming from %s", TASKS_QUEUE)
-    channel.start_consuming()
-
-
-def publish_result(channel: Any, result: ResultMessage) -> None:
-    """Publish a PoW solution to the results queue."""
-    channel.basic_publish(
-        exchange=EXCHANGE,
-        routing_key=f"result.{result.worker_id}",
-        body=result.to_json(),
-    )
-    logger.info("Published result: worker=%s nonce=%d", result.worker_id, result.nonce)
-
-
-# ---------------------------------------------------------------------------
-# Internal callbacks
-# ---------------------------------------------------------------------------
-
-
-def _make_task_callback(
-    on_task: Callable[[TaskMessage], None],
-) -> Callable[[Any, Any, Any, bytes], None]:
-    """Wrap a user-provided callback so it acks the message after success."""
-
-    def _callback(ch: Any, method: Any, _properties: Any, body: bytes) -> None:
-        task = TaskMessage.from_json(body.decode())
-        logger.debug("Received task %s (block %d, range [%d, %d])",
-                      task.task_id, task.block_index, task.range_min, task.range_max)
-        on_task(task)
-        ch.basic_ack(delivery_tag=method.delivery_tag)
-
-    return _callback
-
-
-def _make_control_callback(
-    on_control: Callable[[ControlMessage], None],
-) -> Callable[[Any, Any, Any, bytes], None]:
-    """Wrap a user-provided control callback."""
-
-    def _callback(_ch: Any, _method: Any, _properties: Any, body: bytes) -> None:
-        msg = ControlMessage.from_json(body.decode())
-        logger.debug("Received control: action=%s task_id=%s", msg.action, msg.task_id)
-        on_control(msg)
-
-    return _callback

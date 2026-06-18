@@ -82,7 +82,7 @@ class TestVerify(unittest.TestCase):
         tx_body = {
             "sender": self.pub,
             "receiver": "00" * 32,
-            "amount": 10.0,
+            "amount": 10,
             "concept": "TP1",
         }
         tx_id = hashlib.sha256(json.dumps(tx_body, sort_keys=True).encode()).digest()
@@ -112,6 +112,13 @@ class TestVerify(unittest.TestCase):
         pub = "ab" * 32
         with self.assertRaises(ValueError):
             verify(pub, b"msg", "zz" * 64)
+
+    def test_invalid_curve_point_returns_false_not_crash(self):
+        """C1 fix: all-zeros is valid hex but not a curve point → must return False."""
+        invalid_pub = "00" * 32  # all-zeros is never a valid Ed25519 point
+        valid_sig = "c0" * 64   # any 128 hex chars, structurally valid
+        result = verify(invalid_pub, b"test", valid_sig)
+        self.assertFalse(result, "Invalid curve point should return False, not crash")
 
 
 class TestPubkeyToAddress(unittest.TestCase):

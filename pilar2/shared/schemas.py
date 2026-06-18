@@ -23,14 +23,22 @@ class ErrorResponse(BaseModel):
     error: str
 
 
+_ADDRESS_RE = r"^[0-9a-fA-F]{24}$"
+
 class BalanceResponse(BaseModel):
-    address: str = Field(..., description="Public-key derived address (24 hex chars)")
-    balance: float
+    address: str = Field(
+        ..., min_length=24, max_length=24, pattern=_ADDRESS_RE,
+        description="Public-key derived address (24 hex chars)",
+    )
+    balance: int
 
 
 class AccountResponse(BaseModel):
-    address: str = Field(..., description="Public-key derived address (24 hex chars)")
-    balance: float
+    address: str = Field(
+        ..., min_length=24, max_length=24, pattern=_ADDRESS_RE,
+        description="Public-key derived address (24 hex chars)",
+    )
+    balance: int
     nonce: int = Field(..., ge=0, description="Next expected nonce for this account")
 
 
@@ -38,8 +46,8 @@ class AccountResponse(BaseModel):
 # NCT
 # ---------------------------------------------------------------------------
 
-_PUBKEY_HEX_RE = rf"^[0-9a-f]{{{ED25519_PUBKEY_HEX_LEN}}}$"
-_SIG_HEX_RE = rf"^[0-9a-f]{{{ED25519_SIG_HEX_LEN}}}$"
+_PUBKEY_HEX_RE = rf"^[0-9a-fA-F]{{{ED25519_PUBKEY_HEX_LEN}}}$"
+_SIG_HEX_RE = rf"^[0-9a-fA-F]{{{ED25519_SIG_HEX_LEN}}}$"
 
 
 class TransactionRequest(BaseModel):
@@ -57,7 +65,7 @@ class TransactionRequest(BaseModel):
         pattern=_PUBKEY_HEX_RE,
         description="Ed25519 public key of the receiver (64 hex chars)",
     )
-    amount: float = Field(..., gt=0, description="Amount to transfer")
+    amount: int = Field(..., gt=0, description="Amount to transfer, in smallest unit")
     tx_type: str = Field(
         ..., pattern=r"^(EARN|SPEND)$", description="Transaction type: EARN or SPEND"
     )

@@ -37,7 +37,10 @@ from broker.broker import (
     broadcast_abort,
     declare_topology,
     get_connection,
+    is_recoverable_rabbitmq_error,
+    persistent_props,
     publish_tasks,
+    reconnect_rabbitmq,
 )
 from broker.messages import ControlMessage, ResultMessage, TaskMessage
 from shared.schemas import HealthResponse
@@ -162,7 +165,9 @@ class PoolCoordinator:
         logger.info("Pool %s ready (fallback_workers=%d, heartbeat_timeout=%.0fs) — health on :%d",
                      self.pool_id, self._worker_count_fallback,
                      self._heartbeat_timeout, self.health_port)
-        self._channel.start_consuming()
+
+        # Blocking consume with automatic reconnect (audit H2)
+        _consume_with_reconnect(self)
 
     def shutdown(self) -> None:
         self._shutdown.set()
@@ -226,6 +231,7 @@ class PoolCoordinator:
                         "block_index": task.block_index,
                         "timestamp": time.time(),
                     }, sort_keys=True),
+                    properties=persistent_props(),
                 )
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 return
@@ -286,6 +292,7 @@ class PoolCoordinator:
             exchange=EXCHANGE,
             routing_key=f"result.{self.pool_id}",
             body=result.to_json(),
+            properties=persistent_props(),
         )
         logger.info("Pool %s: valid nonce %d from %s — forwarded to NCT",
                      self.pool_id, result.nonce, result.worker_id)
@@ -308,6 +315,8 @@ class PoolCoordinator:
             exchange=EXCHANGE,
             routing_key=f"pool.{self.pool_id}.control",
             body=msg.to_json(),
+            properties=persistent_props(),
+            mandatory=True,
         )
         logger.info("Pool %s: broadcast abort for task %s", self.pool_id, task_id)
 
@@ -366,6 +375,7 @@ class PoolCoordinator:
                             "block_index": self._current_block_index,
                             "timestamp": time.time(),
                         }, sort_keys=True),
+                        properties=persistent_props(),
                     )
                     return  # no workers left, stop monitoring
 
@@ -404,6 +414,73 @@ def setup_logging(log_file: str | None = None) -> None:
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
         handlers=handlers,
     )
+
+
+# ---------------------------------------------------------------------------
+# Reconnection helpers (audit H2) — module level so they survive reconnects
+# ---------------------------------------------------------------------------
+
+
+def _setup_pool_topology(channel: Any, pool_id: str) -> None:
+    """Re-declare pool-specific queues and bindings on *channel*."""
+    inbox = f"pool.{pool_id}.inbox"
+    channel.queue_declare(queue=inbox, durable=True)
+    channel.queue_bind(exchange=EXCHANGE, queue=inbox, routing_key="task.mining")
+
+    tasks_q = f"pool.{pool_id}.tasks"
+    results_q = f"pool.{pool_id}.results"
+    channel.queue_declare(queue=tasks_q, durable=True)
+    channel.queue_declare(queue=results_q, durable=True)
+    channel.queue_bind(exchange=EXCHANGE, queue=tasks_q,
+                       routing_key=f"pool.{pool_id}.task.*")
+    channel.queue_bind(exchange=EXCHANGE, queue=results_q,
+                       routing_key=f"pool.{pool_id}.result.*")
+
+    registry_q = f"pool.{pool_id}.registry"
+    channel.queue_declare(queue=registry_q, durable=True)
+    channel.queue_bind(exchange=EXCHANGE, queue=registry_q,
+                       routing_key=f"worker.{pool_id}.*")
+
+
+def _consume_with_reconnect(pool: Any) -> None:
+    """Blocking consume loop that reconnects on RabbitMQ failure."""
+    while not pool._shutdown.is_set():
+        try:
+            pool._channel.start_consuming()
+        except Exception as exc:
+            if pool._shutdown.is_set():
+                break
+            if not is_recoverable_rabbitmq_error(exc):
+                logger.exception("Unrecoverable RabbitMQ error — exiting")
+                raise
+            logger.warning(
+                "Pool %s lost RabbitMQ connection: %s. Reconnecting…",
+                pool.pool_id, exc,
+            )
+            try:
+                new_conn, new_ch = reconnect_rabbitmq(pool.rmq_url)
+                _setup_pool_topology(new_ch, pool.pool_id)
+                pool._channel = new_ch
+                pool._channel.basic_qos(prefetch_count=1)
+                pool._channel.basic_consume(
+                    queue=f"pool.{pool.pool_id}.inbox",
+                    on_message_callback=pool._on_mining_task,
+                    auto_ack=False,
+                )
+                pool._channel.basic_consume(
+                    queue=f"pool.{pool.pool_id}.results",
+                    on_message_callback=pool._on_worker_result,
+                    auto_ack=True,
+                )
+                pool._channel.basic_consume(
+                    queue=f"pool.{pool.pool_id}.registry",
+                    on_message_callback=pool._on_worker_heartbeat,
+                    auto_ack=True,
+                )
+                logger.info("Pool %s reconnected and re-subscribed", pool.pool_id)
+            except Exception as reconnect_exc:
+                logger.error("Pool %s reconnect failed: %s", pool.pool_id, reconnect_exc)
+                time.sleep(1)
 
 
 # ---------------------------------------------------------------------------

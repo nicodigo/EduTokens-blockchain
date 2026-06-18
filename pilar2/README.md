@@ -293,13 +293,13 @@ cd pilar2 && uv run python -m unittest tests/test_broker.py -v
 
 Los tests cubren:
 - Serialización/deserialización de TaskMessage, ResultMessage, ControlMessage
-- `declare_topology`: creación de exchange + queues + bindings correctos
-- `publish_tasks`: particionado de nonce space (3 workers, edge case de resto)
-- `consume_result`: polling con resultado encontrado y timeout
-- `broadcast_abort`: publicación de mensaje de control
-- `setup_control_listener`: cola anónima + callback recibe mensaje correctamente
-- `publish_result`: routing key correcta (`result.{worker_id}`)
-- `start_consuming_tasks`: QoS prefetch=1 + ack manual después de procesar
+- `declare_topology`: creación de exchange + queues + bindings correctos + return callback (L1)
+- `declare_consumer_queue`: cola durable + binding correcto (solo workers)
+- `publish_mining_task`: routing key `task.mining`, delivery_mode=2 (H1), mandatory=True (L1)
+- `publish_tasks`: particionado de nonce space (3 workers, edge case de resto), mandatory=True
+- `broadcast_abort`: publicación de mensaje de control con persistence + mandatory
+- `persistent_props`: cache de `BasicProperties(delivery_mode=2)`
+- `is_recoverable_rabbitmq_error`: duck-type de errores transientes pika
 
 ---
 

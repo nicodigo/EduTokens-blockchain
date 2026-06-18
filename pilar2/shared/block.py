@@ -20,7 +20,9 @@ class Transaction:
     Fields:
         sender_pubkey:    Ed25519 public key (64 hex chars) of the sender.
         receiver_pubkey:  Ed25519 public key (64 hex chars) of the receiver.
-        amount:           Amount being transferred. Must be positive.
+        amount:           Amount being transferred, in the smallest unit
+                          (e.g. millitokens, like Ethereum's wei). Must be
+                          a positive integer.
         tx_type:          ``"EARN"`` (university → student) or ``"SPEND"``
                           (student → vendor).
         concept:          Free-text description (e.g. ``"TP1"``, ``"COMEDOR"``).
@@ -30,7 +32,7 @@ class Transaction:
 
     sender_pubkey: str
     receiver_pubkey: str
-    amount: float
+    amount: int
     tx_type: str = ""
     concept: str = ""
     signature: str = ""
@@ -71,9 +73,8 @@ class Transaction:
 
     def to_dict(self) -> dict[str, Any]:
         """Full serialisation, **including** the signature (for storage)."""
-        d = self._signing_dict()
+        d = self._signing_dict()  # already includes nonce
         d["signature"] = self.signature
-        d["nonce"] = self.nonce
         return d
 
     @classmethod
@@ -145,6 +146,14 @@ class Transaction:
                 f"signature must be {ED25519_SIG_HEX_LEN} hex chars, "
                 f"got {len(self.signature)}"
             )
+
+        # -- Nonce -----------------------------------------------------------
+        if self.nonce < 0:
+            errors.append("nonce must be >= 0")
+
+        # -- Timestamp -------------------------------------------------------
+        if self.timestamp <= 0:
+            errors.append("timestamp must be positive")
 
         return errors
 
@@ -269,16 +278,32 @@ class Block:
     # ------------------------------------------------------------------
 
     def validate(self, previous_block: Optional[Block] = None) -> list[str]:
-        """Validate structural integrity.
+        """Validate structural and Proof-of-Work integrity.
 
-        *Note*: Proof-of-Work is **not** checked here — use
-        :meth:`verify_pow` separately.  This keeps structural validation
-        independent of the mining infrastructure.
+        Checks index, chaining, transactions, difficulty range, hash
+        consistency, and MD5 Proof-of-Work (for non-genesis blocks).
         """
         errors: list[str] = []
 
         if self.index < 0:
             errors.append("index must be non-negative")
+
+        # --- previous_hash format ---
+        if len(self.previous_hash) != 64:
+            errors.append(
+                f"previous_hash must be 64 hex chars, got {len(self.previous_hash)}"
+            )
+        else:
+            try:
+                bytes.fromhex(self.previous_hash)
+            except ValueError:
+                errors.append("previous_hash must be hex-encoded")
+
+        # --- Difficulty range ---
+        if self.difficulty < 0 or self.difficulty > 32:
+            errors.append(
+                f"difficulty must be 0-32, got {self.difficulty}"
+            )
 
         # --- Chaining consistency (when a previous block is provided) ---
         if previous_block is not None:
@@ -296,6 +321,10 @@ class Block:
         else:
             if not self.transactions:
                 errors.append("non-genesis block must contain at least one transaction")
+
+            # --- Proof-of-Work (non-genesis only) ---
+            if not Block.verify_pow(self):
+                errors.append("Proof-of-Work verification failed")
 
         # --- Transaction validation ---
         for i, tx in enumerate(self.transactions):

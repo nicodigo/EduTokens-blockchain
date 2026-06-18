@@ -29,7 +29,9 @@ from broker.broker import (
     broadcast_abort,
     declare_topology,
     get_connection,
+    is_recoverable_rabbitmq_error,
     publish_mining_task,
+    reconnect_rabbitmq,
 )
 from broker.messages import ResultMessage
 from nct.state import NCTConfig, NCTState
@@ -44,18 +46,16 @@ from shared.schemas import (
     TransactionResponse,
 )
 from storage.chain_store import (
-    BALANCE_PREFIX,
-    NONCE_PREFIX,
     connect as redis_connect,
     get_balance,
     get_block,
     get_chain_height,
     get_latest_block,
     get_nonce,
-    rebuild_balances_from_chain,
+    rebuild_state_from_chain,
     save_block,
-    update_balances_from_block,
-    update_nonces_from_block,
+    save_block_atomic,
+    validate_chain,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,13 +73,20 @@ def _env_float(name: str, default: float) -> float:
 
 
 def load_config() -> NCTConfig:
+    difficulty = _env_int("DIFFICULTY", 4)
+    if difficulty < 1 or difficulty > 10:
+        raise ValueError(
+            f"DIFFICULTY must be 1-10 (MD5 GPU mining infeasible beyond 10), "
+            f"got {difficulty}"
+        )
+
     return NCTConfig(
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379"),
         rabbitmq_url=os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
         worker_count=_env_int("WORKER_COUNT", 2),
         block_size=_env_int("BLOCK_SIZE", 5),
         block_timeout=_env_float("BLOCK_TIMEOUT", 30.0),
-        difficulty=_env_int("DIFFICULTY", 4),
+        difficulty=difficulty,
         nonce_space=_env_int("NONCE_SPACE", 1_000_000_000),
         port=_env_int("PORT", 8080),
         authority_pubkey=os.getenv("AUTHORITY_PUBKEY", ""),
@@ -123,7 +130,7 @@ def drain_pool_validated(
     must re-send the POST if it wants to retry.
     """
     candidates = state.drain_pool(max_count)
-    overlay: dict[str, float] = {}   # student_id → accumulated delta in this block
+    overlay: dict[str, int] = {}   # student_id → accumulated delta in this block
     nonce_overlay: dict[str, int] = {}  # sender_pubkey → next expected nonce in this block
     valid: list[Transaction] = []
     discarded: list[Transaction] = []
@@ -147,11 +154,11 @@ def drain_pool_validated(
 
         if tx.tx_type == "EARN":
             valid.append(tx)
-            overlay[tx.receiver_pubkey] = overlay.get(tx.receiver_pubkey, 0.0) + tx.amount
+            overlay[tx.receiver_pubkey] = overlay.get(tx.receiver_pubkey, 0) + tx.amount
 
         elif tx.tx_type == "SPEND":
             confirmed = get_balance(redis_client, tx.sender_pubkey)
-            in_flight = overlay.get(tx.sender_pubkey, 0.0)
+            in_flight = overlay.get(tx.sender_pubkey, 0)
             effective = confirmed + in_flight
 
             if effective >= tx.amount:
@@ -161,7 +168,7 @@ def drain_pool_validated(
                 discarded.append(tx)
                 logger.warning(
                     "SPEND descartado — saldo insuficiente: sender=%s "
-                    "confirmado=%.2f en_vuelo=%.2f requerido=%.2f concept=%s",
+                    "confirmado=%d en_vuelo=%d requerido=%d concept=%s",
                     tx.sender_pubkey, confirmed, in_flight, tx.amount, tx.concept,
                 )
 
@@ -211,10 +218,8 @@ def handle_result(
     current_block.nonce = result.nonce
     current_block.hash = current_block.compute_hash()
 
-    # ---- Persist ----
-    save_block(redis_client, current_block)
-    update_balances_from_block(redis_client, current_block)
-    update_nonces_from_block(redis_client, current_block)
+    # ---- Persist atomically (audit H3, M4) ----
+    save_block_atomic(redis_client, current_block)
     state.chain_height = current_block.index + 1
 
     # ---- Broadcast abort / signal block loop ----
@@ -254,6 +259,43 @@ def accumulate_transactions(
 
 
 # ---------------------------------------------------------------------------
+# Reconnection (audit H2)
+# ---------------------------------------------------------------------------
+
+
+def _ensure_rabbitmq_alive(
+    conn_ref: list[Any],
+    ch_ref: list[Any],
+    rmq_url: str,
+) -> None:
+    """Check that the current RabbitMQ channel is alive; reconnect if dead.
+
+    *conn_ref* and *ch_ref* are mutable single-element lists so that
+    multiple threads can share the reconnection.
+    """
+    channel = ch_ref[0]
+    connection = conn_ref[0]
+
+    # Quick health check — passive exchange declare is the lightest way
+    # to know if the channel is still usable.
+    try:
+        if channel is None or connection is None:
+            raise ConnectionError("No channel")
+        if not connection.is_open:
+            raise ConnectionError("Connection closed")
+        if not channel.is_open:
+            raise ConnectionError("Channel closed")
+        channel.exchange_declare(exchange="blockchain", passive=True)
+    except Exception as exc:
+        if not is_recoverable_rabbitmq_error(exc):
+            raise
+        logger.warning("RabbitMQ connection lost — reconnecting…")
+        new_conn, new_ch = reconnect_rabbitmq(rmq_url)
+        conn_ref[0] = new_conn
+        ch_ref[0] = new_ch
+
+
+# ---------------------------------------------------------------------------
 # Loops (one per thread)
 # ---------------------------------------------------------------------------
 
@@ -261,13 +303,18 @@ def accumulate_transactions(
 def block_loop(
     state: NCTState,
     redis_client: Any,
-    channel: Any,
+    conn_ref: list[Any],
+    ch_ref: list[Any],
     config: NCTConfig,
 ) -> None:
     """Thread 1 — accumulate transactions, create blocks, publish mining tasks."""
     logger.info("Block loop started")
 
     while not state.shutdown.is_set():
+        # Ensure RabbitMQ is alive before any publish (audit H2)
+        _ensure_rabbitmq_alive(conn_ref, ch_ref, config.rabbitmq_url)
+        channel = ch_ref[0]
+
         # 1. Accumulate transactions
         txs = accumulate_transactions(state, redis_client, config)
         if not txs:
@@ -324,12 +371,18 @@ def block_loop(
 def result_loop(
     state: NCTState,
     redis_client: Any,
-    channel: Any,
+    conn_ref: list[Any],
+    ch_ref: list[Any],
+    rmq_url: str,
 ) -> None:
     """Thread 2 — poll mining results and worker registry, verify PoW, persist blocks."""
     logger.info("Result loop started")
 
     while not state.shutdown.is_set():
+        # Ensure RabbitMQ is alive before any poll (audit H2)
+        _ensure_rabbitmq_alive(conn_ref, ch_ref, rmq_url)
+        channel = ch_ref[0]
+
         had_work = False
 
         # ---- Poll mining results ----
@@ -495,9 +548,9 @@ def health_loop(app: FastAPI, port: int) -> None:
 def ensure_genesis(redis_client: Any) -> None:
     """Create and persist the genesis block if the chain is empty.
 
-    If the chain already exists but the balance index is empty
-    (e.g. after a crash between ``save_block`` and
-    ``update_balances_from_block``), rebuild it from the chain.
+    If the chain already exists, always rebuild balances and nonces from
+    scratch (idempotent, cheap for PoC chain sizes).  Then run a full
+    structural validation of the chain.
     """
     existing = get_latest_block(redis_client)
     if existing is None:
@@ -506,13 +559,18 @@ def ensure_genesis(redis_client: Any) -> None:
         logger.info("Genesis block created (hash=%s)", genesis.hash)
         return
 
-    # Recovery: chain exists but balance/nonce indexes are empty
-    if get_chain_height(redis_client) > 0:
-        balance_keys = redis_client.keys(f"{BALANCE_PREFIX}*")
-        nonce_keys = redis_client.keys(f"{NONCE_PREFIX}*")
-        if not balance_keys or not nonce_keys:
-            logger.warning("Índices de estado vacíos con cadena existente — reconstruyendo")
-            rebuild_balances_from_chain(redis_client)
+    # Always rebuild derived state on startup (audit L3).
+    # Idempotent, O(n) in chain height — acceptable for a PoC.
+    chain_height = get_chain_height(redis_client)
+    logger.info("Rebuilding state from %d block(s)…", chain_height)
+    rebuild_state_from_chain(redis_client)
+
+    # Validate structural integrity on every startup (audit M3)
+    errors = validate_chain(redis_client)
+    if errors:
+        logger.error("Chain validation failed: %s", errors)
+    else:
+        logger.info("Chain validation passed (%d blocks)", chain_height)
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +601,10 @@ def main() -> None:
     channel = rmq_conn.channel()
     declare_topology(channel)
 
+    # Mutable refs so both threads share reconnection state (audit H2)
+    conn_ref: list[Any] = [rmq_conn]
+    ch_ref: list[Any] = [channel]
+
     # ---- Shared state ----
     state = NCTState()
     state.chain_height = 1  # genesis is block 0 → height = 1
@@ -552,9 +614,10 @@ def main() -> None:
 
     # ---- Threads ----
     threads = [
-        threading.Thread(target=block_loop, args=(state, redis_client, channel, config),
+        threading.Thread(target=block_loop, args=(state, redis_client, conn_ref, ch_ref, config),
                          name="block-loop", daemon=True),
-        threading.Thread(target=result_loop, args=(state, redis_client, channel),
+        threading.Thread(target=result_loop, args=(state, redis_client, conn_ref, ch_ref,
+                                                    config.rabbitmq_url),
                          name="result-loop", daemon=True),
         threading.Thread(target=health_loop, args=(health_app, config.port),
                          name="health-loop", daemon=True),

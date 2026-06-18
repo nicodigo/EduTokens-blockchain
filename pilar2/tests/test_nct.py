@@ -7,6 +7,7 @@ from broker.messages import ResultMessage
 from nct.nct import (
     accumulate_transactions,
     drain_pool_validated,
+    ensure_genesis,
     handle_result,
     verify_pow_result,
 )
@@ -20,7 +21,7 @@ from tests._crypto_fixtures import make_keypair, sign
 # ---------------------------------------------------------------------------
 
 def _make_earn_tx(receiver_pub: str, authority_priv: str, authority_pub: str,
-                  amount: float = 1.0, concept: str = "TP1",
+                  amount: int = 1, concept: str = "TP1",
                   nonce: int = 0) -> Transaction:
     tx = Transaction(
         sender_pubkey=authority_pub,
@@ -35,7 +36,7 @@ def _make_earn_tx(receiver_pub: str, authority_priv: str, authority_pub: str,
 
 
 def _make_spend_tx(sender_priv: str, sender_pub: str, vendor_pub: str,
-                   amount: float = 1.0, concept: str = "COMEDOR",
+                   amount: int = 1, concept: str = "COMEDOR",
                    nonce: int = 0) -> Transaction:
     tx = Transaction(
         sender_pubkey=sender_pub,
@@ -93,9 +94,9 @@ class TestAccumulateTransactions(unittest.TestCase):
         state = NCTState()
         config = NCTConfig(block_size=2, block_timeout=60)
         state.add_transaction(_make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub,
-                                            amount=1.0, nonce=0))
+                                            amount=1, nonce=0))
         state.add_transaction(_make_earn_tx(self.vendor_pub, self.uni_priv, self.uni_pub,
-                                            amount=2.0, nonce=1))
+                                            amount=2, nonce=1))
 
         redis_mock = MagicMock()
         # get_nonce calls redis_client.get("nonce:...") — return None for missing keys
@@ -180,7 +181,10 @@ class TestHandleResult(unittest.TestCase):
 
         self.assertEqual(block.nonce, nonce)
         self.assertEqual(block.hash, block.compute_hash())
-        self.redis.rpush.assert_called_once()
+        # save_block_atomic uses pipeline(transaction=True) → pipe.rpush
+        self.redis.pipeline.assert_called_once_with(transaction=True)
+        self.redis.pipeline.return_value.rpush.assert_called_once()
+        self.redis.pipeline.return_value.execute.assert_called_once()
         self.channel.basic_publish.assert_called()
         self.assertTrue(self.state.block_mined.is_set())
 
@@ -345,6 +349,74 @@ class TestNCTState(unittest.TestCase):
             previous_hash=genesis.hash, difficulty=4,
         )
         return block
+
+
+# ---------------------------------------------------------------------------
+# ensure_genesis  (audit L3, M3)
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureGenesis(unittest.TestCase):
+    """Verify ensure_genesis creates genesis and runs rebuild + validate."""
+
+    @staticmethod
+    def _valid_genesis_json() -> str:
+        import json as _json
+        genesis = Block.create_genesis()
+        return _json.dumps(genesis.to_dict(), sort_keys=True)
+
+    def test_creates_genesis_when_chain_empty(self):
+        client = MagicMock()
+        # get_latest_block → None (chain empty)
+        client.lindex.return_value = None
+        client.llen.return_value = 0
+
+        ensure_genesis(client)
+
+        # Genesis block should have been created and saved via rpush
+        client.rpush.assert_called_once()
+        # pipeline NOT called (genesis path uses save_block directly)
+        client.pipeline.assert_not_called()
+
+    def test_rebuilds_state_and_validates_when_chain_exists(self):
+        """When chain is non-empty, ensure_genesis must:
+        1. Call rebuild_state_from_chain
+        2. Call validate_chain
+        """
+        genesis_json = self._valid_genesis_json()
+
+        client = MagicMock()
+        # get_latest_block: return genesis
+        client.lindex.return_value = genesis_json
+        client.llen.return_value = 1  # 1 block
+
+        ensure_genesis(client)
+
+        # rebuild_state_from_chain walks all blocks via get_block → lindex
+        self.assertTrue(client.lindex.called,
+                        "should read blocks to rebuild state")
+        # validate_chain uses llen + lindex
+        self.assertTrue(client.llen.called,
+                        "should check chain height for validate_chain")
+        # Must NOT have saved genesis again
+        rpush_calls = [c for c in client.method_calls if c[0] == "rpush"]
+        self.assertEqual(len(rpush_calls), 0,
+                         "should not re-save genesis")
+
+    def test_does_not_double_create_genesis(self):
+        """If genesis already exists, it should NOT try to create it again."""
+        genesis_json = self._valid_genesis_json()
+
+        client = MagicMock()
+        client.lindex.return_value = genesis_json
+        client.llen.return_value = 1
+
+        ensure_genesis(client)
+
+        # rpush should NOT be called (no genesis creation)
+        rpush_calls = [c for c in client.method_calls if c[0] == "rpush"]
+        self.assertEqual(len(rpush_calls), 0,
+                         "should not save genesis when chain already exists")
 
 
 if __name__ == "__main__":

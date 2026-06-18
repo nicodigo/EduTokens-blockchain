@@ -25,6 +25,9 @@ from broker.broker import (
     WORKER_REGISTRY_QUEUE,
     declare_topology,
     get_connection,
+    is_recoverable_rabbitmq_error,
+    persistent_props,
+    reconnect_rabbitmq,
 )
 from broker.messages import ControlMessage, ResultMessage, TaskMessage
 from miner.miner import MinerService
@@ -114,8 +117,8 @@ class WorkerService:
 
     def run(self) -> None:
         self.start_time = time.time()
-        conn = get_connection(url=self.rmq_url)
-        self._channel = conn.channel()
+        self._connection = get_connection(url=self.rmq_url)
+        self._channel = self._connection.channel()
         declare_topology(self._channel)
 
         # Bind to task source: fanout inbox (solo) or pool queue
@@ -157,7 +160,30 @@ class WorkerService:
                      self.worker_id,
                      f"pool={self.pool_id}" if self.pool_id else "solo",
                      self.health_port)
-        self._channel.start_consuming()
+
+        # Blocking consume with automatic reconnect (audit H2)
+        while not self._shutdown.is_set():
+            try:
+                self._channel.start_consuming()
+            except Exception as exc:
+                if self._shutdown.is_set():
+                    break
+                if not is_recoverable_rabbitmq_error(exc):
+                    logger.exception("Unrecoverable RabbitMQ error — exiting")
+                    raise
+                logger.warning(
+                    "Worker %s lost RabbitMQ connection: %s. Reconnecting…",
+                    self.worker_id, exc,
+                )
+                try:
+                    self._connection, self._channel = reconnect_rabbitmq(self.rmq_url)
+                    self._re_bind_queues()
+                    self._setup_control_listener()
+                    self._setup_task_consumer(tasks_queue)
+                    logger.info("Worker %s reconnected", self.worker_id)
+                except Exception as reconnect_exc:
+                    logger.error("Worker %s reconnect failed: %s", self.worker_id, reconnect_exc)
+                    time.sleep(1)
 
     def shutdown(self) -> None:
         self._shutdown.set()
@@ -166,6 +192,24 @@ class WorkerService:
                 self._channel.stop_consuming()
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # Re-bind queues after reconnect (audit H2)
+    # ------------------------------------------------------------------
+
+    def _re_bind_queues(self) -> None:
+        """Re-declare pool/solo task queue on the new channel after reconnect."""
+        if self.pool_id:
+            tasks_q = f"pool.{self.pool_id}.tasks"
+            self._channel.queue_declare(queue=tasks_q, durable=True)
+            self._channel.queue_bind(
+                exchange=EXCHANGE, queue=tasks_q,
+                routing_key=f"pool.{self.pool_id}.task.*",
+            )
+        else:
+            inbox = f"worker.{self.worker_id}.inbox"
+            from broker.broker import declare_consumer_queue
+            declare_consumer_queue(self._channel, inbox, "task.mining")
 
     # ------------------------------------------------------------------
     # Health HTTP server
@@ -190,20 +234,29 @@ class WorkerService:
             exchange=EXCHANGE,
             routing_key=key,
             body=json.dumps(msg, sort_keys=True),
+            properties=persistent_props(),
         )
 
     def _heartbeat_loop(self) -> None:
-        # Open a dedicated connection so we never share a channel across threads.
-        hb_conn = get_connection(url=self.rmq_url)
-        hb_channel = hb_conn.channel()
+        # Use a dedicated channel on the shared connection (audit L2).
+        # pika allows multiple channels per connection as long as each
+        # channel is used from a single thread — which is the case here.
+        hb_channel: Any = None
 
         while not self._shutdown.is_set():
             self._shutdown.wait(timeout=self.heartbeat_interval)
-            if not self._shutdown.is_set():
-                try:
-                    self._send_heartbeat(hb_channel)
-                except Exception:
-                    logger.warning("Heartbeat send failed (connection may be down)")
+            if self._shutdown.is_set():
+                break
+            try:
+                # Get or refresh the heartbeat channel
+                if hb_channel is None or not hb_channel.is_open:
+                    hb_channel = self._connection.channel()
+                self._send_heartbeat(hb_channel)
+            except Exception:
+                logger.warning(
+                    "Worker %s heartbeat send failed — will retry", self.worker_id,
+                )
+                hb_channel = None  # force refresh on next iteration
 
     # ------------------------------------------------------------------
     # Control listener (abort)
@@ -286,6 +339,7 @@ class WorkerService:
                 exchange=EXCHANGE,
                 routing_key=result_key,
                 body=msg.to_json(),
+                properties=persistent_props(),
             )
             logger.info("Nonce found: %d (hash=%s)", result.nonce, result.hash)
         else:

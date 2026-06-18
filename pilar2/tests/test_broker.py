@@ -1,4 +1,4 @@
-"""Unit tests for broker messages and topology (mock pika)."""
+"""Unit tests for broker topology and publish operations (mock pika)."""
 
 import json
 import unittest
@@ -7,15 +7,14 @@ from unittest.mock import MagicMock, call, patch
 from broker.broker import (
     EXCHANGE,
     RESULTS_QUEUE,
-    TASKS_QUEUE,
     WORKER_REGISTRY_QUEUE,
     broadcast_abort,
-    consume_result,
+    declare_consumer_queue,
     declare_topology,
-    publish_result,
+    is_recoverable_rabbitmq_error,
+    persistent_props,
+    publish_mining_task,
     publish_tasks,
-    setup_control_listener,
-    start_consuming_tasks,
 )
 from broker.messages import ControlMessage, ResultMessage, TaskMessage
 
@@ -83,18 +82,54 @@ class TestDeclareTopology(unittest.TestCase):
         channel.exchange_declare.assert_called_once_with(
             exchange=EXCHANGE, exchange_type="topic", durable=True
         )
-        # mining_tasks is no longer a shared queue (pools/solo miners declare their own)
         channel.queue_bind.assert_any_call(
             exchange=EXCHANGE, queue=RESULTS_QUEUE, routing_key="result.*"
         )
         channel.queue_bind.assert_any_call(
             exchange=EXCHANGE, queue=WORKER_REGISTRY_QUEUE, routing_key="worker.*"
         )
+        # Audit L1: return callback registered
+        channel.add_on_return_callback.assert_called_once()
+
+
+class TestDeclareConsumerQueue(unittest.TestCase):
+    """Tests for declare_consumer_queue — used by solo workers."""
+
+    def test_declares_durable_queue_and_binds(self):
+        channel = MagicMock()
+        declare_consumer_queue(channel, "worker.abc.inbox", "task.mining")
+
+        channel.queue_declare.assert_called_once_with(
+            queue="worker.abc.inbox", durable=True,
+        )
+        channel.queue_bind.assert_called_once_with(
+            exchange=EXCHANGE, queue="worker.abc.inbox", routing_key="task.mining",
+        )
 
 
 # ---------------------------------------------------------------------------
-# Coordinator operations
+# Publish operations
 # ---------------------------------------------------------------------------
+
+
+class TestPublishMiningTask(unittest.TestCase):
+    def test_publishes_with_correct_routing_key_and_properties(self):
+        channel = MagicMock()
+        task = publish_mining_task(
+            channel, block_index=1, fingerprint="ff",
+            difficulty=4, range_size=100,
+        )
+
+        self.assertEqual(task.block_index, 1)
+        channel.basic_publish.assert_called_once()
+        call_args = channel.basic_publish.call_args
+        self.assertEqual(call_args[1]["exchange"], EXCHANGE)
+        self.assertEqual(call_args[1]["routing_key"], "task.mining")
+        # Audit H1: persistent
+        props = call_args[1]["properties"]
+        self.assertEqual(props.delivery_mode, 2)
+        # Audit L1: mandatory
+        self.assertTrue(call_args[1]["mandatory"])
 
 
 class TestPublishTasks(unittest.TestCase):
@@ -103,10 +138,10 @@ class TestPublishTasks(unittest.TestCase):
         tasks = publish_tasks(
             channel, block_index=1, fingerprint="f", difficulty=2,
             num_workers=3, range_size=300,
+            routing_key_prefix="task",
         )
 
         self.assertEqual(len(tasks), 3)
-        # Ranges should be [0,99], [100,199], [200,299]
         self.assertEqual(tasks[0].range_min, 0)
         self.assertEqual(tasks[0].range_max, 99)
         self.assertEqual(tasks[1].range_min, 100)
@@ -121,33 +156,32 @@ class TestPublishTasks(unittest.TestCase):
         tasks = publish_tasks(
             channel, block_index=1, fingerprint="f", difficulty=2,
             num_workers=3, range_size=100,
+            routing_key_prefix="task",
         )
-        self.assertEqual(tasks[-1].range_max, 99)  # 100-1
+        self.assertEqual(tasks[-1].range_max, 99)
 
-
-class TestConsumeResult(unittest.TestCase):
-    def test_returns_result_when_found(self):
+    def test_requires_routing_key_prefix(self):
+        """M2: routing_key_prefix is required — TypeError without it."""
         channel = MagicMock()
-        result = ResultMessage(
-            task_id="t1", block_index=1, worker_id="w1",
-            nonce=42, hash="0000abcd",
+        with self.assertRaises(TypeError):
+            publish_tasks(
+                channel, block_index=1, fingerprint="f", difficulty=2,
+                num_workers=3, range_size=100,
+                # missing routing_key_prefix
+            )
+
+    def test_publishes_with_persistent_and_mandatory(self):
+        """H1 + L1: each task publish must have delivery_mode=2 and mandatory=True."""
+        channel = MagicMock()
+        publish_tasks(
+            channel, block_index=1, fingerprint="f", difficulty=2,
+            num_workers=1, range_size=100,
+            routing_key_prefix="pool.abc.task",
         )
-
-        # First get returns a result
-        method = MagicMock()
-        channel.basic_get.return_value = (method, None, result.to_json().encode())
-
-        got = consume_result(channel, timeout_seconds=1, poll_interval=0.01)
-        self.assertIsNotNone(got)
-        assert got is not None
-        self.assertEqual(got.nonce, 42)
-
-    def test_returns_none_on_timeout(self):
-        channel = MagicMock()
-        channel.basic_get.return_value = (None, None, None)
-
-        got = consume_result(channel, timeout_seconds=0.05, poll_interval=0.01)
-        self.assertIsNone(got)
+        call_args = channel.basic_publish.call_args
+        props = call_args[1]["properties"]
+        self.assertEqual(props.delivery_mode, 2)
+        self.assertTrue(call_args[1]["mandatory"])
 
 
 class TestBroadcastAbort(unittest.TestCase):
@@ -164,102 +198,53 @@ class TestBroadcastAbort(unittest.TestCase):
         self.assertEqual(body["action"], "abort")
         self.assertEqual(body["task_id"], "task-abc")
 
+        # H1 + L1
+        props = call_args[1]["properties"]
+        self.assertEqual(props.delivery_mode, 2)
+        self.assertTrue(call_args[1]["mandatory"])
+
 
 # ---------------------------------------------------------------------------
-# Worker operations
+# Persistent properties  (audit H1)
 # ---------------------------------------------------------------------------
 
 
-class TestSetupControlListener(unittest.TestCase):
-    def test_creates_anonymous_queue_and_binds(self):
-        channel = MagicMock()
-        mock_result = MagicMock()
-        mock_result.method.queue = "amq.gen-fake"
-        channel.queue_declare.return_value = mock_result
+class TestPersistentProps(unittest.TestCase):
+    """Verify that persistent_props() returns delivery_mode=2."""
 
-        received: list[ControlMessage] = []
-        qname = setup_control_listener(channel, received.append)
+    def test_returns_basic_properties_with_delivery_mode_2(self):
+        props = persistent_props()
+        self.assertEqual(props.delivery_mode, 2)
 
-        self.assertEqual(qname, "amq.gen-fake")
-        channel.queue_bind.assert_called_once_with(
-            exchange=EXCHANGE, queue="amq.gen-fake", routing_key="control"
-        )
-
-    def test_callback_receives_control_message(self):
-        channel = MagicMock()
-        mock_result = MagicMock()
-        mock_result.method.queue = "amq.gen-xyz"
-        channel.queue_declare.return_value = mock_result
-
-        received: list[ControlMessage] = []
-        setup_control_listener(channel, received.append)
-
-        # Grab the registered callback and simulate a message
-        consume_call = channel.basic_consume.call_args
-        callback = consume_call[1]["on_message_callback"]
-
-        msg = ControlMessage(action="abort", task_id="t42")
-        callback(channel, MagicMock(), None, msg.to_json().encode())
-
-        self.assertEqual(len(received), 1)
-        self.assertEqual(received[0].action, "abort")
-        self.assertEqual(received[0].task_id, "t42")
+    def test_cache_reuses_same_instance(self):
+        a = persistent_props()
+        b = persistent_props()
+        self.assertIs(a, b, "persistent_props() should cache the same instance")
 
 
-class TestPublishResult(unittest.TestCase):
-    def test_publishes_to_results_routing_key(self):
-        channel = MagicMock()
-        result = ResultMessage(
-            task_id="t1", block_index=1, worker_id="worker-x",
-            nonce=7, hash="0000dead",
-        )
-        publish_result(channel, result)
-
-        channel.basic_publish.assert_called_once()
-        call_args = channel.basic_publish.call_args
-        self.assertEqual(call_args[1]["routing_key"], "result.worker-x")
+# ---------------------------------------------------------------------------
+# Reconnection helpers  (audit H2)
+# ---------------------------------------------------------------------------
 
 
-class TestStartConsumingTasks(unittest.TestCase):
-    def test_sets_qos_and_consumes(self):
-        channel = MagicMock()
-        # Prevent start_consuming from blocking
-        channel.start_consuming.side_effect = StopIteration
+class TestIsRecoverableError(unittest.TestCase):
+    def test_connection_closed_is_recoverable(self):
+        # Duck-type: type name contains "ConnectionClosed"
+        class ConnectionClosed(Exception):
+            pass
+        exc = ConnectionClosed("boom")
+        self.assertTrue(is_recoverable_rabbitmq_error(exc))
 
-        on_task = MagicMock()
-        with self.assertRaises(StopIteration):
-            start_consuming_tasks(channel, on_task)
+    def test_stream_lost_is_recoverable(self):
+        # Duck-type: type name contains "StreamLostError"
+        class StreamLostError(Exception):
+            pass
+        exc = StreamLostError("boom")
+        self.assertTrue(is_recoverable_rabbitmq_error(exc))
 
-        channel.basic_qos.assert_called_once_with(prefetch_count=1)
-        channel.basic_consume.assert_called_once()
-        self.assertEqual(channel.basic_consume.call_args[1]["queue"], TASKS_QUEUE)
-
-    def test_task_callback_acks_after_processing(self):
-        channel = MagicMock()
-        channel.start_consuming.side_effect = StopIteration
-
-        processed: list[TaskMessage] = []
-
-        with self.assertRaises(StopIteration):
-            start_consuming_tasks(channel, processed.append)
-
-        # Grab callback and simulate a message
-        consume_call = channel.basic_consume.call_args
-        callback = consume_call[1]["on_message_callback"]
-
-        task = TaskMessage.create(
-            block_index=3, fingerprint="f", difficulty=4,
-            range_min=0, range_max=100,
-        )
-        delivery_tag = 123
-        method = MagicMock()
-        method.delivery_tag = delivery_tag
-
-        callback(channel, method, None, task.to_json().encode())
-
-        self.assertEqual(len(processed), 1)
-        self.assertEqual(processed[0].block_index, 3)
-        channel.basic_ack.assert_called_once_with(delivery_tag=delivery_tag)
+    def test_value_error_is_not_recoverable(self):
+        exc = ValueError("bad value")
+        self.assertFalse(is_recoverable_rabbitmq_error(exc))
 
 
 if __name__ == "__main__":
