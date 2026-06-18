@@ -57,8 +57,11 @@ from storage.chain_store import (
     get_latest_block,
     get_nonce,
     rebuild_state_from_chain,
+    restore_pending_txs,
     save_block,
     save_block_atomic,
+    save_pending_tx,
+    trim_pending_txs,
     validate_chain,
 )
 
@@ -172,6 +175,13 @@ def drain_pool_validated(
         for tx in discarded:
             add_discarded_tx(redis_client, tx.sender_pubkey, tx.tx_id)
 
+    # Audit L2: remove drained transactions from Redis so they are not
+    # re-queued on restart.  The count is (valid + discarded) — everything
+    # that was taken out of the pool.
+    drained_count = len(valid) + len(discarded)
+    if drained_count > 0:
+        trim_pending_txs(redis_client, drained_count)
+
     return valid
 
 
@@ -187,7 +197,10 @@ def handle_result(
     Returns ``True`` if the block was successfully mined and persisted.
     """
     # ---- Duplicate guard: block already mined by another worker ----
-    if state.block_mined.is_set():
+    # Audit M2: use mining_active() instead of block_mined.is_set() to
+    # decouple the "is mining in progress" semantic from the Event used
+    # to signal the block_loop thread.
+    if not state.mining_active():
         logger.debug("Resultado duplicado para bloque ya minado — descartado")
         return False
 
@@ -225,7 +238,7 @@ def handle_result(
 
     # ---- Broadcast abort / signal block loop ----
     broadcast_abort(channel, result.task_id)
-    state.block_mined.set()
+    state.mark_mining_complete()
 
     logger.info(
         "Block %d mined by %s (nonce=%d, hash=%s)",
@@ -344,8 +357,26 @@ def block_loop(
         # 4. Mining loop with range expansion on timeout
         nonce_space = config.nonce_space
         mined = False
+        _consecutive_dead_checks = 0
 
         while not mined and not state.shutdown.is_set():
+            # ---- Pool liveness gate (audit H2) ----
+            if state.all_pools_dead():
+                _consecutive_dead_checks += 1
+                if _consecutive_dead_checks == 1:
+                    logger.critical(
+                        "All pools dead — no workers available for block %d. "
+                        "Waiting for pool recovery…",
+                        block.index,
+                    )
+                # Backoff: wait, then re-check.  Don't publish to dead pools.
+                backoff = min(_consecutive_dead_checks * 5, 60)
+                if state.block_mined.wait(timeout=backoff):
+                    mined = True
+                    break
+                continue
+            _consecutive_dead_checks = 0
+
             state.set_current_block(block, nonce_space)
 
             publish_mining_task(
@@ -365,8 +396,15 @@ def block_loop(
             if mined:
                 break
 
-            # Timeout — expand range and retry
-            nonce_space *= 2
+            # Timeout — expand range and retry (audit L1: capped)
+            nonce_space = min(nonce_space * 2, config.max_nonce_space)
+            if nonce_space >= config.max_nonce_space:
+                logger.critical(
+                    "MAX_NONCE_SPACE (%d) reached for block %d — "
+                    "mining may be broken (no workers, difficulty too high, "
+                    "or bug in miner)",
+                    config.max_nonce_space, block.index,
+                )
             logger.warning("Mining timeout for block %d, expanding to %d", block.index, nonce_space)
 
     logger.info("Block loop stopped")
@@ -416,7 +454,7 @@ def result_loop(
                     pass  # channel may be dead; reconnection handles it
             had_work = True
 
-        # ---- Poll worker registry (heartbeats) ----
+        # ---- Poll worker registry (heartbeats + pool liveness) ----
         method, _properties, body = channel.basic_get(
             queue=WORKER_REGISTRY_QUEUE, auto_ack=False,
         )
@@ -424,10 +462,15 @@ def result_loop(
             try:
                 data = json.loads(body.decode())
                 if data.get("action") == "pool_no_workers":
-                    logger.warning(
+                    pool_id = data.get("worker_id", "unknown")
+                    logger.error(
                         "Pool '%s' reports no workers for block %s",
-                        data.get("worker_id"), data.get("block_index"),
+                        pool_id, data.get("block_index"),
                     )
+                    state.mark_pool_dead(pool_id)
+                elif data.get("role") == "pool":
+                    # Pool heartbeat (pool registers as a "worker" from NCT's view)
+                    state.mark_pool_alive(data.get("worker_id", "unknown"))
                 else:
                     state.update_worker(data.get("worker_id", "unknown"))
             except Exception:
@@ -495,6 +538,7 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
             chain_height=state.chain_height,
             pending_transactions=state.pool_size(),
             current_block=cb.index if cb else None,
+            active_pools=state.active_pools(),
         )
 
     @app.post(
@@ -563,6 +607,8 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
                 )
 
         state.add_transaction(t)
+        # Audit L2: persist so the tx survives an NCT restart
+        save_pending_tx(redis_client, t)
         return TransactionResponse(tx_id=t.tx_id)
 
     @app.get("/balance/{address}", response_model=BalanceResponse)
@@ -693,8 +739,17 @@ def main() -> None:
     result_ch_ref: list[Any] = [result_channel]
 
     # ---- Shared state ----
-    state = NCTState()
+    state = NCTState(pool_timeout=config.pool_timeout)
     state.chain_height = 1  # genesis is block 0 → height = 1
+
+    # Audit L2: restore pending transactions from Redis so they survive
+    # an NCT crash/restart.  Transactions already mined (but not yet trimmed
+    # from Redis) will be caught by nonce validation in drain_pool_validated.
+    pending = restore_pending_txs(redis_client)
+    if pending:
+        for tx in pending:
+            state.add_transaction(tx)
+        logger.info("Restored %d pending transaction(s) from Redis", len(pending))
 
     # ---- FastAPI app (wired to shared state) ----
     health_app = create_health_app(state, redis_client, config)

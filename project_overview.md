@@ -371,7 +371,7 @@ Replace with `./md5_range` (compiled CUDA binary) on GPU hosts.
 | Method | Route | Response |
 |---|---|---|
 | `GET` | `/health` | `{"status": "ok"}` |
-| `GET` | `/status` | `{"chain_height": N, "pending_transactions": M, "current_block": X}` |
+| `GET` | `/status` | `{"chain_height": N, "pending_transactions": M, "current_block": X, "active_pools": P}` |
 | `POST` | `/transaction` | `{"tx_id": "..."}` (201) or `{"error": "..."}` (400) |
 | `GET` | `/balance/{pubkey}` | `{"address": "...", "balance": 42.5}` |
 | `GET` | `/chain` | Full serialised chain as JSON array (audit trail) |
@@ -381,7 +381,7 @@ The server is built with **FastAPI** and served via **uvicorn** in a background 
 
 ### Test coverage (`tests/`)
 
-61 unit tests, all run without real Redis or RabbitMQ (mocked via `MagicMock` / `FakeClient`):
+226 unit tests, all run without real Redis or RabbitMQ (mocked via `MagicMock` / `FakeClient`):
 
 | Test file | What it covers |
 |---|---|
@@ -459,7 +459,7 @@ open http://localhost:15672  # guest / guest
 
 6. **FastAPI + uvicorn** — HTTP layer uses FastAPI with Pydantic schemas for strong request/response contracts, served by uvicorn in a background thread.
 
-7. **Pool architecture** — NCT publishes one task (full range) per block to `task.mining`. Pools subscribe via topic fanout and partition internally among their workers. Worker count is dynamic (driven by heartbeats) with a configurable fallback.
+7. **Competitive pool architecture (audit H3)** — NCT publishes one task (full range) per block to `task.mining` via a topic exchange. Pools subscribe via topic fanout and ALL compete on the SAME nonce space; the first valid result wins. With N pools, (N-1)/N of GPU compute is redundant work — an accepted trade-off in this PoC for implementation simplicity. The `active_pools` field on the NCT `/status` endpoint makes this redundancy observable. For production, the architecture would be refactored to partition the nonce space across pools cooperatively.
 
 8. **Lazy imports in broker** — `pika` is only imported when a connection is actually needed, so the test suite runs without RabbitMQ installed.
 

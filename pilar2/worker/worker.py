@@ -29,7 +29,7 @@ from broker.broker import (
     persistent_props,
     reconnect_rabbitmq,
 )
-from broker.messages import ControlMessage, ResultMessage, TaskMessage
+from broker.messages import ControlMessage, RegistrationMessage, ResultMessage, TaskMessage
 from miner.miner import MinerService
 from shared.env import env_int, env_float
 from shared.schemas import (
@@ -150,6 +150,16 @@ class WorkerService:
         # Task consumer (blocking — must be last)
         self._setup_task_consumer(tasks_queue)
 
+        # Audit M3: register with the pool before sending heartbeats.
+        # This eliminates the "0 workers until first heartbeat" window.
+        if self.pool_id:
+            reg = RegistrationMessage(
+                worker_id=self.worker_id,
+                pool_id=self.pool_id,
+                timestamp=time.time(),
+            )
+            self._publish_registration(self._channel, reg)
+
         # Send first heartbeat only after task consumer is set up.
         # This serves as the readiness signal: the pool won't count us
         # as active until it sees at least one heartbeat post-init.
@@ -233,7 +243,7 @@ class WorkerService:
             "action": "heartbeat",
             "timestamp": time.time(),
         }
-        key = f"worker.{self.pool_id}.heartbeat" if self.pool_id else "worker.heartbeat"
+        key = f"pool-worker.{self.pool_id}.heartbeat" if self.pool_id else "worker.heartbeat"
         channel.basic_publish(
             exchange=EXCHANGE,
             routing_key=key,
@@ -261,6 +271,23 @@ class WorkerService:
                     "Worker %s heartbeat send failed — will retry", self.worker_id,
                 )
                 hb_channel = None  # force refresh on next iteration
+
+    # ------------------------------------------------------------------
+    # Registration (audit M3)
+    # ------------------------------------------------------------------
+
+    def _publish_registration(self, channel: Any, reg: RegistrationMessage) -> None:
+        """Publish a worker registration message to the pool."""
+        key = f"pool.{reg.pool_id}.register"
+        channel.basic_publish(
+            exchange=EXCHANGE,
+            routing_key=key,
+            body=reg.to_json(),
+            properties=persistent_props(),
+        )
+        logger.info(
+            "Worker %s registered with pool %s", reg.worker_id, reg.pool_id,
+        )
 
     # ------------------------------------------------------------------
     # Control listener (abort)

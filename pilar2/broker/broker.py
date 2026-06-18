@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 EXCHANGE = "blockchain"
+DEAD_LETTER_EXCHANGE = "blockchain.dlx"
+DEAD_LETTER_QUEUE = "dead_letters"
 RESULTS_QUEUE = "mining_results"
 WORKER_REGISTRY_QUEUE = "worker_registry"
 CONTROL_ROUTING_KEY = "control"
@@ -174,16 +176,28 @@ def declare_topology(channel: Any) -> None:
     """
     channel.exchange_declare(exchange=EXCHANGE, exchange_type="topic", durable=True)
 
+    # Audit M4: Dead-Letter Exchange — catches messages that are nacked,
+    # rejected, or expired so they aren't silently lost.
+    channel.exchange_declare(exchange=DEAD_LETTER_EXCHANGE, exchange_type="fanout", durable=True)
+    channel.queue_declare(queue=DEAD_LETTER_QUEUE, durable=True,
+                          arguments={"x-queue-type": "classic"})
+    channel.queue_bind(exchange=DEAD_LETTER_EXCHANGE, queue=DEAD_LETTER_QUEUE,
+                       routing_key="")
+
+    dlx_args = {"x-dead-letter-exchange": DEAD_LETTER_EXCHANGE}
+
     # Shared results queue (workers/pools → NCT)
-    channel.queue_declare(queue=RESULTS_QUEUE, durable=True)
+    channel.queue_declare(queue=RESULTS_QUEUE, durable=True, arguments=dlx_args)
     channel.queue_bind(exchange=EXCHANGE, queue=RESULTS_QUEUE, routing_key="result.*")
 
     # Worker registry queue (workers → NCT heartbeats & registration)
-    channel.queue_declare(queue=WORKER_REGISTRY_QUEUE, durable=True)
-    # Audit H2 corrected: use worker.# so pools (worker.pool-a) and their
-    # status messages (worker.pool-a.status) match, not just solo workers
-    # (worker.heartbeat).  The pool is the worker from the NCT's perspective.
+    channel.queue_declare(queue=WORKER_REGISTRY_QUEUE, durable=True, arguments=dlx_args)
+    # Audit H2 corrected: use worker.# so pools (worker.pool-a) match, not
+    # just solo workers (worker.heartbeat).  Pool is the worker from NCT's view.
     channel.queue_bind(exchange=EXCHANGE, queue=WORKER_REGISTRY_QUEUE, routing_key="worker.#")
+    # Audit L3: pool status messages use a dedicated routing key space so the
+    # NCT doesn't need fragile ``action``-field differentiation.
+    channel.queue_bind(exchange=EXCHANGE, queue=WORKER_REGISTRY_QUEUE, routing_key="pool.*.status")
 
     # Audit L1: log returned messages (mandatory=True publishes with no binding)
     channel.add_on_return_callback(_on_return)

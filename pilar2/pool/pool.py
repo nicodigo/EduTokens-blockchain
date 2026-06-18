@@ -106,10 +106,12 @@ class PoolCoordinator:
         self._heartbeat_timeout = heartbeat_timeout
         self._worker_heartbeats: dict[str, float] = {}
         self._ready_workers: set[str] = set()  # workers that have sent ≥1 heartbeat post-init
+        self._registered_workers: set[str] = set()  # audit M3: workers that sent registration
 
-        # Dead-worker monitor
+        # Dead-worker monitor (audit H1: generation counter prevents TOCTOU race)
         self._monitor_thread: Optional[threading.Thread] = None
         self._monitor_active: threading.Event = threading.Event()
+        self._monitor_generation: int = 0
         self._original_worker_count: int = 0
         self._monitor_interval = env_float("POOL_MONITOR_INTERVAL", DEFAULT_MONITOR_INTERVAL)
         self._result_timeout = env_float("POOL_RESULT_TIMEOUT", DEFAULT_RESULT_TIMEOUT)
@@ -149,7 +151,15 @@ class PoolCoordinator:
         registry_q = f"pool.{self.pool_id}.registry"
         self._channel.queue_declare(queue=registry_q, durable=True)
         self._channel.queue_bind(exchange=EXCHANGE, queue=registry_q,
-                                 routing_key=f"worker.{self.pool_id}.*")
+                                 routing_key=f"pool-worker.{self.pool_id}.*")
+
+        # Worker registration queue (audit M3) — separate from heartbeats
+        # so the pool knows exactly which workers to expect before the
+        # first heartbeat arrives.
+        reg_q = f"pool.{self.pool_id}.registrations"
+        self._channel.queue_declare(queue=reg_q, durable=True)
+        self._channel.queue_bind(exchange=EXCHANGE, queue=reg_q,
+                                 routing_key=f"pool.{self.pool_id}.register")
 
         # Health HTTP server
         threading.Thread(target=self._run_health, daemon=True, name="health").start()
@@ -168,6 +178,8 @@ class PoolCoordinator:
         self._channel.basic_consume(queue=results_q, on_message_callback=self._on_worker_result,
                                      auto_ack=False)
         self._channel.basic_consume(queue=registry_q, on_message_callback=self._on_worker_heartbeat,
+                                     auto_ack=True)
+        self._channel.basic_consume(queue=reg_q, on_message_callback=self._on_worker_registration,
                                      auto_ack=True)
 
         logger.info("Pool %s ready (fallback_workers=%d, heartbeat_timeout=%.0fs) — health on :%d",
@@ -197,8 +209,29 @@ class PoolCoordinator:
             self._worker_heartbeats[data["worker_id"]] = time.time()
             self._ready_workers.add(data["worker_id"])
 
+    # ------------------------------------------------------------------
+    # Worker registration (audit M3)
+    # ------------------------------------------------------------------
+
+    def _on_worker_registration(self, _ch: Any, _method: Any, _props: Any, body: bytes) -> None:
+        """Record a worker as explicitly registered with this pool.
+
+        Audit M3: this closes the "dynamic worker count starts at 0" gap.
+        Before the first heartbeat, the pool knows which workers to expect
+        because they sent a RegistrationMessage at startup.
+        """
+        data = json.loads(body.decode())
+        wid = data.get("worker_id", "unknown")
+        with self._heartbeat_lock:
+            self._registered_workers.add(wid)
+        logger.info("Pool %s: worker %s registered", self.pool_id, wid)
+
     def _get_active_worker_count(self) -> int:
-        """Return number of ready workers that sent a heartbeat recently."""
+        """Return number of ready workers that sent a heartbeat recently.
+
+        Audit M3: only counts workers that are both registered AND have a
+        recent heartbeat.  Unregistered workers sending heartbeats are ignored.
+        """
         cutoff = time.time() - self._heartbeat_timeout
         with self._heartbeat_lock:
             stale = [
@@ -207,17 +240,42 @@ class PoolCoordinator:
             for wid in stale:
                 del self._worker_heartbeats[wid]
                 self._ready_workers.discard(wid)
-            # Only count workers that are alive AND ready (initialised)
-            return len([
-                wid for wid in self._worker_heartbeats
-                if wid in self._ready_workers
-            ])
+            # Count workers that are alive AND ready (initialised).
+            # Audit M3: if registration messages HAVE been received, only count
+            # workers that explicitly registered.  When no registrations have
+            # arrived yet (e.g. solo workers, startup before reg message),
+            # fall back to the old behaviour of counting all ready workers.
+            if self._registered_workers:
+                candidates = [
+                    wid for wid in self._worker_heartbeats
+                    if wid in self._ready_workers and wid in self._registered_workers
+                ]
+            else:
+                candidates = [
+                    wid for wid in self._worker_heartbeats
+                    if wid in self._ready_workers
+                ]
+            return len(candidates)
 
     # ------------------------------------------------------------------
     # Mining task → partition & distribute
     # ------------------------------------------------------------------
 
     def _on_mining_task(self, ch: Any, method: Any, _props: Any, body: bytes) -> None:
+        """Consume a mining task published by the NCT and fan it out to workers.
+
+        **Competitive pool architecture (audit H3):** the NCT publishes one
+        ``TaskMessage`` to the ``task.mining`` topic exchange.  Every pool
+        subscribed to this exchange receives a copy.  Pools then compete:
+        each partitions the *full* nonce space among its own workers, and
+        the first pool to find a valid PoW wins.  With N pools, (N-1)/N
+        of the total GPU compute is redundant work — an accepted
+        trade-off in this PoC for implementation simplicity.
+
+        The ``active_pools`` field on the NCT ``/status`` endpoint reports
+        how many pools are currently competing, making the redundancy
+        observable.
+        """
         task = TaskMessage.from_json(body.decode())
         logger.info("Received mining task for block %d (range=[%d, %d])",
                      task.block_index, task.range_min, task.range_max)
@@ -232,7 +290,7 @@ class PoolCoordinator:
                 # Signal NCT so it doesn't wait uselessly
                 self._channel.basic_publish(
                     exchange=EXCHANGE,
-                    routing_key=f"worker.{self.pool_id}.status",
+                    routing_key=f"pool.{self.pool_id}.status",
                     body=json.dumps({
                         "worker_id": self.pool_id,
                         "action": "pool_no_workers",
@@ -262,14 +320,15 @@ class PoolCoordinator:
             routing_key_prefix=f"pool.{self.pool_id}.task",
         )
 
-        # Start dead-worker monitor
+        # Start dead-worker monitor — always fresh per task (audit H1)
         self._original_worker_count = count
+        self._monitor_generation += 1
+        gen = self._monitor_generation
         self._monitor_active.set()
-        if self._monitor_thread is None or not self._monitor_thread.is_alive():
-            self._monitor_thread = threading.Thread(
-                target=self._monitor_loop, daemon=True, name="monitor",
-            )
-            self._monitor_thread.start()
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop, args=(gen,), daemon=True, name="monitor",
+        )
+        self._monitor_thread.start()
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
@@ -369,19 +428,27 @@ class PoolCoordinator:
     # Dead-worker monitor
     # ------------------------------------------------------------------
 
-    def _monitor_loop(self) -> None:
+    def _monitor_loop(self, generation: int) -> None:
         """Periodically check if workers died mid-mining and re-publish if so.
 
         Only reacts when the active worker count drops below what it was
         when the task was published — this indicates a worker died and its
         sub-range is orphaned.  Does NOT republish when workers are alive
         but slow; the NCT timeout handles that case.
+
+        *generation* is the value of ``_monitor_generation`` at the time
+        this monitor was started.  If it no longer matches the current
+        generation (because a new task arrived and a fresher monitor
+        replaced this one), the loop exits immediately — closing the
+        TOCTOU race documented in audit H1.
         """
         start = time.time()
-        while self._monitor_active.is_set():
+        while self._monitor_active.is_set() and self._monitor_generation == generation:
             self._monitor_active.wait(timeout=self._monitor_interval)
             if not self._monitor_active.is_set():
                 return
+            if self._monitor_generation != generation:
+                return  # superseded by a newer monitor (audit H1)
 
             # M2: snapshot mining context under lock for this iteration.
             with self._mining_lock:
@@ -425,7 +492,7 @@ class PoolCoordinator:
                     # No workers left at all — signal NCT
                     self._channel.basic_publish(
                         exchange=EXCHANGE,
-                        routing_key=f"worker.{self.pool_id}.status",
+                        routing_key=f"pool.{self.pool_id}.status",
                         body=json.dumps({
                             "worker_id": self.pool_id,
                             "action": "pool_no_workers",
@@ -521,7 +588,12 @@ def _setup_pool_topology(channel: Any, pool_id: str) -> None:
     registry_q = f"pool.{pool_id}.registry"
     channel.queue_declare(queue=registry_q, durable=True)
     channel.queue_bind(exchange=EXCHANGE, queue=registry_q,
-                       routing_key=f"worker.{pool_id}.*")
+                       routing_key=f"pool-worker.{pool_id}.*")
+
+    reg_q = f"pool.{pool_id}.registrations"
+    channel.queue_declare(queue=reg_q, durable=True)
+    channel.queue_bind(exchange=EXCHANGE, queue=reg_q,
+                       routing_key=f"pool.{pool_id}.register")
 
 
 def _consume_with_reconnect(pool: Any) -> None:
@@ -557,6 +629,11 @@ def _consume_with_reconnect(pool: Any) -> None:
                 pool._channel.basic_consume(
                     queue=f"pool.{pool.pool_id}.registry",
                     on_message_callback=pool._on_worker_heartbeat,
+                    auto_ack=True,
+                )
+                pool._channel.basic_consume(
+                    queue=f"pool.{pool.pool_id}.registrations",
+                    on_message_callback=pool._on_worker_registration,
                     auto_ack=True,
                 )
                 logger.info("Pool %s reconnected and re-subscribed", pool.pool_id)

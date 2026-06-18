@@ -100,6 +100,9 @@ class NCTStatusResponse(BaseModel):
     current_block: int | None = Field(
         None, description="Index of the block currently being mined, if any"
     )
+    active_pools: int = Field(
+        0, description="Number of pools with a recent heartbeat (audit H3 health check)"
+    )
 
 
 # ---------------------------------------------------------------------------

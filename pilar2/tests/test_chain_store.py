@@ -7,11 +7,15 @@ from unittest.mock import MagicMock
 from shared.block import Block, Transaction
 from storage.chain_store import (
     BLOCKS_KEY,
+    PENDING_TXS_KEY,
     get_block,
     get_chain_height,
     get_latest_block,
+    restore_pending_txs,
     save_block,
     save_block_atomic,
+    save_pending_tx,
+    trim_pending_txs,
     validate_chain,
 )
 from tests._crypto_fixtures import make_keypair, sign
@@ -318,6 +322,77 @@ class TestSaveBlockAtomic(unittest.TestCase):
         # (In real Redis, MULTI commands are queued, not executed until EXEC)
         client.pipeline.assert_called_once_with(transaction=True)
         client.pipeline.return_value.execute.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Pending transaction persistence (audit L2)
+# ---------------------------------------------------------------------------
+
+
+class TestPendingTxPersistence(unittest.TestCase):
+    """L2: Pending transactions are persisted to Redis so they survive NCT restarts."""
+
+    def setUp(self):
+        _, self.student_pub, _ = make_keypair()
+        self.uni_priv, self.uni_pub, _ = make_keypair()
+
+    def _earn_tx(self, amount: int = 10) -> Transaction:
+        return _make_earn_tx(self.student_pub, self.uni_priv, self.uni_pub, amount=amount)
+
+    def test_save_pending_tx_rpushes_json(self):
+        """L2: save_pending_tx must RPUSH the serialised transaction."""
+        client = MagicMock()
+        tx = self._earn_tx(5)
+        save_pending_tx(client, tx)
+        client.rpush.assert_called_once_with(
+            PENDING_TXS_KEY, json.dumps(tx.to_dict(), sort_keys=True),
+        )
+
+    def test_trim_removes_first_n_items(self):
+        """L2: trim_pending_txs must LTRIM from the given count, preserving
+        items at index >= count."""
+        client = MagicMock()
+        trim_pending_txs(client, 3)
+        client.ltrim.assert_called_once_with(PENDING_TXS_KEY, 3, -1)
+
+    def test_trim_zero_does_nothing(self):
+        """L2: trim_pending_txs with count=0 must be a no-op."""
+        client = MagicMock()
+        trim_pending_txs(client, 0)
+        client.ltrim.assert_not_called()
+
+    def test_restore_returns_deserialised_txs(self):
+        """L2: restore_pending_txs must deserialise all items in insertion order."""
+        tx1 = self._earn_tx(10)
+        tx2 = self._earn_tx(20)
+        client = MagicMock()
+        client.lrange.return_value = [
+            json.dumps(tx1.to_dict(), sort_keys=True),
+            json.dumps(tx2.to_dict(), sort_keys=True),
+        ]
+        restored = restore_pending_txs(client)
+        self.assertEqual(len(restored), 2)
+        self.assertEqual(restored[0].tx_id, tx1.tx_id)
+        self.assertEqual(restored[1].tx_id, tx2.tx_id)
+        client.lrange.assert_called_once_with(PENDING_TXS_KEY, 0, -1)
+
+    def test_restore_empty_redis_returns_empty_list(self):
+        """L2: restore_pending_txs on empty Redis returns []."""
+        client = MagicMock()
+        client.lrange.return_value = []
+        self.assertEqual(restore_pending_txs(client), [])
+
+    def test_restore_skips_corrupt_entries(self):
+        """L2: restore_pending_txs must skip unparseable entries without crashing."""
+        tx = self._earn_tx(10)
+        client = MagicMock()
+        client.lrange.return_value = [
+            b"not valid json",
+            json.dumps(tx.to_dict(), sort_keys=True),
+        ]
+        restored = restore_pending_txs(client)
+        self.assertEqual(len(restored), 1)
+        self.assertEqual(restored[0].tx_id, tx.tx_id)
 
 
 if __name__ == "__main__":

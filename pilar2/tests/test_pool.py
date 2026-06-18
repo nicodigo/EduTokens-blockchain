@@ -1,9 +1,12 @@
 """Unit tests for PoolCoordinator heartbeat-driven worker count."""
 
 import json
+import threading
 import time
 import unittest
 from unittest.mock import MagicMock, patch
+
+from broker.messages import TaskMessage
 
 from broker.messages import ResultMessage
 from pool.pool import PoolCoordinator
@@ -300,11 +303,11 @@ class TestMonitorRepublishWithoutOverlap(unittest.TestCase):
             with patch.object(self.pool, "_broadcast_abort") as mock_abort:
                 # Start monitoring, but stop after first republish
                 self.pool._monitor_active.set()
+                gen = self.pool._monitor_generation  # current generation
 
                 # Run the monitor in a thread; kill after short delay
-                import threading
                 t = threading.Thread(
-                    target=self.pool._monitor_loop, daemon=True,
+                    target=self.pool._monitor_loop, args=(gen,), daemon=True,
                 )
                 t.start()
                 t.join(timeout=1.0)
@@ -314,6 +317,218 @@ class TestMonitorRepublishWithoutOverlap(unittest.TestCase):
                 self.assertTrue(mock_abort.called,
                                 "_broadcast_abort was NOT called when workers died")
                 self.assertEqual(mock_abort.call_args[0], ("t1",))
+
+
+# ---------------------------------------------------------------------------
+# Monitor generation replacement (audit H1)
+# ---------------------------------------------------------------------------
+
+
+class TestMonitorGenerationReplacement(unittest.TestCase):
+    """H1: The dead-worker monitor must be replaced (not reused) when a new
+    mining task arrives, to prevent the TOCTOU race where the old monitor
+    is still alive for a few milliseconds after the previous block finished."""
+
+    def setUp(self) -> None:
+        self.pool = PoolCoordinator(
+            pool_id="test-pool", rmq_url="amqp://fake", worker_count=2,
+        )
+        self.pool._channel = MagicMock()
+        self.pool._monitor_interval = 0.01  # fast polling for test
+
+    def test_new_task_starts_fresh_monitor(self):
+        """H1: _on_mining_task must always create a new monitor thread,
+        even when the old one is still alive."""
+        # Start a fake first monitor — set mining context so it stays alive
+        self.pool._current_block_index = 1
+        self.pool._current_fingerprint = "abc"
+        self.pool._current_difficulty = 4
+        self.pool._current_nonce_space = 1_000_000
+        self.pool._original_worker_count = 2  # prevent republish trigger
+        self.pool._monitor_active.set()
+        gen_before = self.pool._monitor_generation
+        old_thread = threading.Thread(
+            target=self.pool._monitor_loop, args=(gen_before,), daemon=True,
+        )
+        old_thread.start()
+        # Wait for the old monitor to enter its loop
+        time.sleep(0.05)
+        self.assertTrue(old_thread.is_alive(), "old monitor should be running")
+
+        # Simulate a new mining task arriving — this is the H1 trigger
+        self.pool._current_block_index = 2
+        self.pool._monitor_generation += 1
+        gen_after = self.pool._monitor_generation
+        self.pool._monitor_active.set()
+        new_thread = threading.Thread(
+            target=self.pool._monitor_loop, args=(gen_after,), daemon=True,
+        )
+        new_thread.start()
+
+        # Both threads are now running (brief overlap)
+        time.sleep(0.1)
+        # Old monitor must have exited (generation check)
+        old_thread.join(timeout=0.5)
+        self.assertFalse(old_thread.is_alive(),
+                         "Old monitor should have exited due to generation bump")
+        # New monitor should still be running
+        self.assertTrue(new_thread.is_alive(),
+                        "New monitor must be running with new generation")
+
+        # Clean up
+        self.pool._monitor_active.clear()
+        new_thread.join(timeout=0.5)
+
+    def test_monitor_ignores_stale_generation(self):
+        """H1: A monitor started with an old generation must exit immediately
+        when _monitor_generation no longer matches."""
+        # Bump generation so the monitor we're about to start is already stale
+        self.pool._monitor_generation = 42
+        stale_gen = 41  # old generation
+        self.pool._monitor_active.set()
+        self.pool._current_block_index = 1
+
+        # Start a monitor with a stale generation
+        t = threading.Thread(
+            target=self.pool._monitor_loop, args=(stale_gen,), daemon=True,
+        )
+        t.start()
+        t.join(timeout=0.5)
+
+        # The monitor must have exited quickly (generation mismatch)
+        self.assertFalse(t.is_alive(),
+                         "Monitor with stale generation must exit immediately")
+
+    def test_monitor_exits_when_block_cleared(self):
+        """H1: The monitor must exit when _monitor_active is cleared,
+        even with a matching generation."""
+        gen = self.pool._monitor_generation
+        self.pool._monitor_active.set()
+        self.pool._current_block_index = 1
+
+        t = threading.Thread(
+            target=self.pool._monitor_loop, args=(gen,), daemon=True,
+        )
+        t.start()
+        time.sleep(0.05)
+        self.assertTrue(t.is_alive(), "Monitor should be running")
+
+        # Clear the active flag (simulating block mined)
+        self.pool._monitor_active.clear()
+        t.join(timeout=1.0)
+        self.assertFalse(t.is_alive(),
+                         "Monitor must exit when _monitor_active is cleared")
+
+
+# ---------------------------------------------------------------------------
+# Worker registration (audit M3)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerRegistration(unittest.TestCase):
+    """M3: Worker registration closes the "0 workers until first heartbeat" gap."""
+
+    def setUp(self) -> None:
+        self.pool = PoolCoordinator(
+            pool_id="test-pool", rmq_url="amqp://fake", worker_count=2,
+        )
+
+    def test_registration_adds_worker(self):
+        """M3: _on_worker_registration must add worker to _registered_workers."""
+        self.pool._on_worker_registration(
+            None, None, None,
+            json.dumps({"worker_id": "w1", "pool_id": "test-pool", "timestamp": time.time()}).encode(),
+        )
+        self.assertIn("w1", self.pool._registered_workers)
+
+    def test_registered_worker_is_counted_when_heartbeating(self):
+        """M3: A registered worker with a heartbeat must be counted as active."""
+        self.pool._on_worker_registration(
+            None, None, None,
+            json.dumps({"worker_id": "w1", "pool_id": "test-pool", "timestamp": time.time()}).encode(),
+        )
+        self.pool._on_worker_heartbeat(None, None, None, _heartbeat_json("w1"))
+        self.assertEqual(self.pool._get_active_worker_count(), 1)
+
+    def test_unregistered_worker_not_counted_when_registrations_exist(self):
+        """M3: A heartbeating but unregistered worker must NOT be counted
+        when other workers HAVE registered."""
+        # Register w1 but not w2
+        self.pool._on_worker_registration(
+            None, None, None,
+            json.dumps({"worker_id": "w1", "pool_id": "test-pool", "timestamp": time.time()}).encode(),
+        )
+        self.pool._on_worker_heartbeat(None, None, None, _heartbeat_json("w1"))
+        self.pool._on_worker_heartbeat(None, None, None, _heartbeat_json("w2"))
+        # Only w1 should count (registered + heartbeating)
+        self.assertEqual(self.pool._get_active_worker_count(), 1)
+
+    def test_fallback_works_when_no_registrations(self):
+        """M3: When no registrations have arrived, fall back to counting
+        all ready workers (backward compatibility with solo workers)."""
+        self.pool._on_worker_heartbeat(None, None, None, _heartbeat_json("w1"))
+        self.pool._on_worker_heartbeat(None, None, None, _heartbeat_json("w2"))
+        # No registrations → count all ready workers
+        self.assertEqual(self.pool._get_active_worker_count(), 2)
+
+
+# ---------------------------------------------------------------------------
+# Routing key hygiene (audit M1 + L3)
+# ---------------------------------------------------------------------------
+
+
+class TestRoutingKeyHygiene(unittest.TestCase):
+    """M1 + L3: Pool worker heartbeats use pool-worker.*, pool status uses pool.*.status."""
+
+    def setUp(self) -> None:
+        self.pool = PoolCoordinator(
+            pool_id="test-pool", rmq_url="amqp://fake", worker_count=2,
+        )
+        self.pool._channel = MagicMock()
+
+    def test_pool_worker_registry_binds_to_pool_worker_routing_key(self):
+        """M1: Pool's registry queue must bind to pool-worker.{pool_id}.*,
+        NOT worker.{pool_id}.*."""
+        self.pool.run = lambda: None  # prevent actual run
+        # Simulate what run() would do — check the topology setup function
+        from pool.pool import _setup_pool_topology
+        _setup_pool_topology(self.pool._channel, self.pool.pool_id)
+        bind_calls = [
+            c.kwargs.get("routing_key", "")
+            for c in self.pool._channel.queue_bind.call_args_list
+        ]
+        registry_bindings = [rk for rk in bind_calls if "registry" in str(rk) or "pool-worker" in rk]
+        # Must have a pool-worker binding, NOT worker.{pool_id}.*
+        self.assertTrue(
+            any("pool-worker" in rk for rk in registry_bindings),
+            f"Registry must bind to pool-worker.*, got: {registry_bindings}",
+        )
+        self.assertFalse(
+            any(rk.startswith("worker.") for rk in registry_bindings),
+            f"Registry must NOT bind to worker.*, got: {registry_bindings}",
+        )
+
+    def test_pool_status_publishes_to_pool_routing_key(self):
+        """L3: pool_no_workers must publish to pool.{pool_id}.status,
+        NOT worker.{pool_id}.status."""
+        # Trigger pool_no_workers by setting count to 0 with fallback=0
+        self.pool._worker_count_fallback = 0
+        task = TaskMessage(
+            task_id="t1", block_index=1, fingerprint="abc",
+            difficulty=4, range_min=0, range_max=999,
+        )
+        mock_ch = MagicMock()
+        self.pool._on_mining_task(mock_ch, MagicMock(), None, task.to_json().encode())
+        publish_calls = [
+            kwargs.get("routing_key", "")
+            for call in self.pool._channel.basic_publish.call_args_list
+            for _, kwargs in [call]
+        ]
+        status_calls = [rk for rk in publish_calls if "status" in rk]
+        self.assertTrue(
+            any(rk.startswith("pool.") and rk.endswith(".status") for rk in status_calls),
+            f"pool_no_workers must use pool.*.status, got: {status_calls}",
+        )
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock, call, patch
 
 from broker.broker import (
+    DEAD_LETTER_EXCHANGE,
     EXCHANGE,
     RESULTS_QUEUE,
     WORKER_REGISTRY_QUEUE,
@@ -79,8 +80,12 @@ class TestDeclareTopology(unittest.TestCase):
         channel = MagicMock()
         declare_topology(channel)
 
-        channel.exchange_declare.assert_called_once_with(
+        # Main topic exchange + audit M4 dead-letter exchange
+        channel.exchange_declare.assert_any_call(
             exchange=EXCHANGE, exchange_type="topic", durable=True
+        )
+        channel.exchange_declare.assert_any_call(
+            exchange=DEAD_LETTER_EXCHANGE, exchange_type="fanout", durable=True
         )
         channel.queue_bind.assert_any_call(
             exchange=EXCHANGE, queue=RESULTS_QUEUE, routing_key="result.*"

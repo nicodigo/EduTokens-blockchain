@@ -134,3 +134,40 @@ class ControlMessage:
     def from_json(cls, raw: str) -> ControlMessage:
         d: dict[str, Any] = json.loads(raw)
         return cls(action=d["action"], task_id=d["task_id"])
+
+
+# ---------------------------------------------------------------------------
+# RegistrationMessage  —  Worker  →  Pool  (audit M3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RegistrationMessage:
+    """Sent by a pool worker at startup so the pool knows exactly which
+    workers to expect, closing the "dynamic worker count starts at 0" gap
+    (audit M3).
+    """
+
+    worker_id: str
+    pool_id: str
+    timestamp: float
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "worker_id": self.worker_id,
+                "pool_id": self.pool_id,
+                "action": "register",
+                "timestamp": self.timestamp,
+            },
+            sort_keys=True,
+        )
+
+    @classmethod
+    def from_json(cls, raw: str) -> RegistrationMessage:
+        d: dict[str, Any] = json.loads(raw)
+        return cls(
+            worker_id=d["worker_id"],
+            pool_id=d["pool_id"],
+            timestamp=d["timestamp"],
+        )

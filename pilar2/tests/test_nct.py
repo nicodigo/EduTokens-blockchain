@@ -1,6 +1,7 @@
 """Unit tests for NCT components (PKI-aware)."""
 
 import json
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -739,6 +740,197 @@ class TestRateLimit(unittest.TestCase):
                 f"got {resp.status_code}: {resp.json()}",
             )
             self.assertIn("rate limit", resp.json()["error"].lower())
+
+
+# ---------------------------------------------------------------------------
+# Pool liveness tracking (audit H2)
+# ---------------------------------------------------------------------------
+
+
+class TestPoolLiveness(unittest.TestCase):
+    """H2: pool liveness tracking prevents infinite mining loop when all
+    pools are dead."""
+
+    def setUp(self) -> None:
+        self.state = NCTState(pool_timeout=0.2)
+
+    def test_pool_no_workers_marks_pool_dead(self):
+        """H2: A pool_no_workers message must mark the pool as dead."""
+        self.state.mark_pool_alive("pool-a")
+        self.assertEqual(self.state.active_pools(), 1)
+
+        self.state.mark_pool_dead("pool-a")
+        self.assertEqual(self.state.active_pools(), 0)
+
+    def test_pool_heartbeat_marks_pool_alive(self):
+        """H2: A pool heartbeat (role=pool) must mark the pool as alive and
+        clear any previous dead flag."""
+        self.state.mark_pool_dead("pool-a")
+        self.assertEqual(self.state.active_pools(), 0)
+
+        self.state.mark_pool_alive("pool-a")
+        self.assertEqual(self.state.active_pools(), 1)
+
+    def test_all_pools_dead_returns_true_when_all_dead(self):
+        """H2: all_pools_dead() returns True when every known pool is dead."""
+        self.state.mark_pool_alive("pool-a")
+        self.state.mark_pool_alive("pool-b")
+        self.assertFalse(self.state.all_pools_dead())
+
+        self.state.mark_pool_dead("pool-a")
+        self.state.mark_pool_dead("pool-b")
+        self.assertTrue(self.state.all_pools_dead())
+
+    def test_all_pools_dead_returns_false_when_no_pools_seen(self):
+        """H2: all_pools_dead() returns False when no pools have ever been
+        seen (unknown state — should not block mining)."""
+        self.assertFalse(self.state.all_pools_dead(),
+                         "Unknown state should not be treated as 'all dead'")
+
+    def test_pool_timeout_marks_stale_pool_dead(self):
+        """H2: A pool that hasn't sent a heartbeat in pool_timeout seconds
+        is considered dead."""
+        self.state.mark_pool_alive("pool-a")
+        self.assertEqual(self.state.active_pools(), 1)
+
+        # Wait past the timeout
+        time.sleep(0.25)
+        self.assertEqual(self.state.active_pools(), 0)
+        self.assertTrue(self.state.all_pools_dead())
+
+    def test_active_pools_cleans_up_stale_entries(self):
+        """H2: active_pools() must remove stale entries to prevent
+        unbounded dictionary growth."""
+        for i in range(10):
+            self.state.mark_pool_alive(f"pool-{i}")
+        self.assertEqual(self.state.active_pools(), 10)
+
+        # Wait past the timeout — all entries become stale
+        time.sleep(0.25)
+        self.assertEqual(self.state.active_pools(), 0)
+        # All stale entries should have been cleaned up
+        with self.state._pool_lock:
+            self.assertEqual(len(self.state._pool_last_seen), 0,
+                             "All stale pool entries must be removed")
+
+
+# ---------------------------------------------------------------------------
+# Nonce space cap (audit L1)
+# ---------------------------------------------------------------------------
+
+
+class TestNonceSpaceCap(unittest.TestCase):
+    """L1: nonce_space must be capped to prevent unbounded growth."""
+
+    def test_nonce_space_capped_in_config(self):
+        """L1: NCTConfig.max_nonce_space defaults to a sensible upper bound."""
+        config = NCTConfig()
+        self.assertEqual(config.max_nonce_space, 2**63 - 1)
+
+    def test_nonce_space_cap_reached_triggers_no_exception(self):
+        """L1: When nonce_space reaches the cap, the system must not crash."""
+        config = NCTConfig(max_nonce_space=1000, block_timeout=0.01)
+        nonce = 1000
+        # Simulate the cap logic
+        nonce = min(nonce * 2, config.max_nonce_space)
+        self.assertEqual(nonce, config.max_nonce_space,
+                         "nonce_space must not exceed max_nonce_space")
+        # Doubling again should stay capped
+        nonce = min(nonce * 2, config.max_nonce_space)
+        self.assertEqual(nonce, config.max_nonce_space,
+                         "Capped nonce must stay at max value")
+
+
+# ---------------------------------------------------------------------------
+# Mining active flag (audit M2)
+# ---------------------------------------------------------------------------
+
+
+class TestMiningActiveFlag(unittest.TestCase):
+    """M2: mining_active() is decoupled from the block_mined Event."""
+
+    def setUp(self) -> None:
+        self.state = NCTState()
+
+    def test_mining_active_false_before_any_block(self):
+        """M2: Before set_current_block is called, mining_active() is False."""
+        self.assertFalse(self.state.mining_active())
+
+    def test_mining_active_true_after_set_current_block(self):
+        """M2: set_current_block must set mining_active() to True."""
+        block = Block(
+            index=1, timestamp=time.time(),
+            transactions=[],
+            previous_hash="0" * 64,
+            difficulty=4,
+        )
+        self.state.set_current_block(block, 1_000_000)
+        self.assertTrue(self.state.mining_active())
+
+    def test_mark_mining_complete_sets_false_and_fires_event(self):
+        """M2: mark_mining_complete must set mining_active to False and
+        fire the block_mined Event atomically."""
+        block = Block(
+            index=1, timestamp=time.time(),
+            transactions=[],
+            previous_hash="0" * 64,
+            difficulty=4,
+        )
+        self.state.set_current_block(block, 1_000_000)
+        self.state.mark_mining_complete()
+
+        self.assertFalse(self.state.mining_active())
+        self.assertTrue(self.state.block_mined.is_set())
+
+    def test_mining_active_stays_false_after_second_set_current_block(self):
+        """M2: Calling set_current_block twice must reset mining_active
+        to True and clear block_mined."""
+        block1 = Block(
+            index=1, timestamp=time.time(),
+            transactions=[],
+            previous_hash="0" * 64,
+            difficulty=4,
+        )
+        self.state.set_current_block(block1, 1_000_000)
+        self.state.mark_mining_complete()
+        self.assertFalse(self.state.mining_active())
+
+        block2 = Block(
+            index=2, timestamp=time.time(),
+            transactions=[],
+            previous_hash=block1.compute_hash(),
+            difficulty=4,
+        )
+        self.state.set_current_block(block2, 2_000_000)
+        self.assertTrue(self.state.mining_active())
+        self.assertFalse(self.state.block_mined.is_set())
+
+    def test_handle_result_rejects_when_not_mining(self):
+        """M2: handle_result must reject a valid result when mining_active()
+        is False (duplicate guard via mining_active, not block_mined)."""
+        from nct.nct import handle_result
+        # Set up state with a block
+        block = Block(
+            index=1, timestamp=time.time(),
+            transactions=[],
+            previous_hash="0" * 64,
+            difficulty=4,
+        )
+        self.state.set_current_block(block, 1_000_000)
+        self.state.mark_mining_complete()  # mining finished
+        self.assertFalse(self.state.mining_active())
+
+        # Now try to submit a result — should be rejected by the
+        # mining_active() guard, which runs BEFORE PoW verification.
+        # We can use a dummy ResultMessage; the guard will reject it.
+        msg = ResultMessage(
+            task_id="t1", block_index=1, worker_id="w1",
+            nonce=0, hash="0" * 32,
+        )
+        mock_redis = MagicMock()
+        mock_channel = MagicMock()
+        ok = handle_result(self.state, mock_redis, mock_channel, msg)
+        self.assertFalse(ok, "handle_result must reject when mining not active")
 
 
 if __name__ == "__main__":

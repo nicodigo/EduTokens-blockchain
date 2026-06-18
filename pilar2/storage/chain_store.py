@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Optional
 if TYPE_CHECKING:
     from redis import Redis
 
-from shared.block import Block
+from shared.block import Block, Transaction
 
 # ---------------------------------------------------------------------------
 # Redis key layout
@@ -35,6 +35,7 @@ BLOCKS_KEY = "blockchain:blocks"
 BALANCE_PREFIX = "balance:"
 NONCE_PREFIX = "nonce:"
 DISCARDED_PREFIX = "discarded:"
+PENDING_TXS_KEY = "blockchain:pending_txs"  # audit L2: crash recovery
 
 # ---------------------------------------------------------------------------
 # Connection
@@ -287,6 +288,59 @@ def rebuild_state_from_chain(client: Any) -> None:
             set_nonce(client, tx.sender_pubkey, tx.nonce + 1)
 
     logger.info("State rebuilt")
+
+
+# ---------------------------------------------------------------------------
+# Pending transaction pool persistence (audit L2)
+# ---------------------------------------------------------------------------
+
+
+def save_pending_tx(client: Any, tx: Transaction) -> None:
+    """Append *tx* to the pending-transaction list in Redis.
+
+    Called on every ``POST /transaction`` so that if the NCT crashes, the
+    transaction is not lost — it is restored on the next startup.
+    """
+    client.rpush(PENDING_TXS_KEY, json.dumps(tx.to_dict(), sort_keys=True))
+
+
+def restore_pending_txs(client: Any) -> list[Transaction]:
+    """Return all transactions that were pending at the time of the last crash.
+
+    Reads the full ``PENDING_TXS_KEY`` list, deserialises every entry, and
+    returns them in insertion order (oldest first).  Returns an empty list
+    when no pending transactions exist (fresh start or clean shutdown).
+    """
+    raw_list = client.lrange(PENDING_TXS_KEY, 0, -1)
+    txs: list[Transaction] = []
+    for raw in raw_list:
+        try:
+            txs.append(Transaction.from_dict(json.loads(raw)))
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Skipping unreadable pending tx: %s", raw[:100],
+            )
+    return txs
+
+
+def trim_pending_txs(client: Any, count: int) -> None:
+    """Remove the first *count* transactions from the pending list.
+
+    Called after ``drain_pool_validated`` returns — the drained transactions
+    are now in a block (mined or soon-to-be-mined) and should not be
+    re-queued on restart.
+    """
+    if count <= 0:
+        return
+    # LTRIM key start stop: keeps elements from start to stop (0-based).
+    # LTRIM count -1 removes the first *count* items.
+    client.ltrim(PENDING_TXS_KEY, count, -1)
+
+
+def clear_pending_txs(client: Any) -> None:
+    """Remove all pending transactions (used during clean shutdown)."""
+    client.delete(PENDING_TXS_KEY)
 
 
 # Backward-compatible alias
