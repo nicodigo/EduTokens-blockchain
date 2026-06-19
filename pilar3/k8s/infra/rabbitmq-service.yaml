@@ -19,6 +19,10 @@ spec:
   type: LoadBalancer
   # Descomentar cuando la IP esté reservada:
   # loadBalancerIP: "<RABBITMQ_STATIC_IP>"
+  # Restringir AMQPS (puerto 5671) al cluster GPU del profesor
+  # Cuando se conozcan los CIDRs, reemplazar 0.0.0.0/0
+  loadBalancerSourceRanges:
+  - "0.0.0.0/0"  # ⚠️ REEMPLAZAR con IPs del cluster GPU
   selector:
     app: rabbitmq
   ports:

@@ -1,0 +1,18 @@
+# Ejemplo de terraform.tfvars
+# Copiar a terraform.tfvars y completar los valores.
+
+project_id        = "edutokens-2026"
+region            = "us-central1"
+zone              = "us-central1-a"
+cluster_name      = "edutokens-cluster"
+domain_name       = "edutokens.duckdns.org"
+letsencrypt_email = "tu-email@example.com"
+
+# IPs de salida del cluster GPU del profesor (pedirlas)
+# Ejemplo: gpu_source_ranges = ["203.0.113.0/28"]
+gpu_source_ranges = []
+
+# Free tier quotas
+node_machine_type = "e2-standard-2"   # 2 vCPUs × 2 nodos = 4 total (cuota: 8)
+node_count        = 2
+node_disk_size_gb = 30
