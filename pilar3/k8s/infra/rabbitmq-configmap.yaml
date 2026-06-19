@@ -1,0 +1,31 @@
+# RabbitMQ ConfigMap — configuración de listeners y TLS
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-config
+  namespace: infra
+  labels:
+    app: rabbitmq
+data:
+  rabbitmq.conf: |
+    ## AMQP (sin TLS) — para NCT y Pool dentro del cluster
+    listeners.tcp.default = 5672
+
+    ## AMQPS (con TLS) — para Workers externos
+    listeners.ssl.default = 5671
+
+    ## Certificados TLS generados por cert-manager
+    ssl_options.cacertfile = /etc/rabbitmq/ssl/ca.crt
+    ssl_options.certfile   = /etc/rabbitmq/ssl/tls.crt
+    ssl_options.keyfile    = /etc/rabbitmq/ssl/tls.key
+
+    ## TLS: verifica peer pero no exige certificado de cliente
+    ssl_options.verify               = verify_peer
+    ssl_options.fail_if_no_peer_cert = false
+    ssl_options.depth                = 2
+
+    ## Management UI
+    management.tcp.port = 15672
+
+  enabled_plugins: |
+    [rabbitmq_management,rabbitmq_prometheus].

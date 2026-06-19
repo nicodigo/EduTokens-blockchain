@@ -1,0 +1,8 @@
+# Namespace: blockchain
+# NCT (coordinador) + Pool (coordinador de workers)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: blockchain
+  labels:
+    name: blockchain

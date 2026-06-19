@@ -1,0 +1,8 @@
+# Namespace: infra
+# RabbitMQ + Redis — servicios compartidos de infraestructura
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: infra
+  labels:
+    name: infra

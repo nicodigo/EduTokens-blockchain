@@ -1,0 +1,18 @@
+# NCT Service — ClusterIP interno
+# NCT no tiene IP pública. Es accedido vía Ingress desde el frontend.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nct
+  namespace: blockchain
+  labels:
+    app: nct
+spec:
+  type: ClusterIP
+  selector:
+    app: nct
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP

@@ -1,0 +1,69 @@
+# Pool Deployment — coordinador de workers
+# Un pool por deployment. Si se necesitan múltiples pools competitivos,
+# crear deployments adicionales con distinto POOL_ID.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pool-a
+  namespace: blockchain
+  labels:
+    app: pool-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pool-a
+  template:
+    metadata:
+      labels:
+        app: pool-a
+        metrics: "enabled"
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: pool-a
+        image: us-central1-docker.pkg.dev/edutokens/edutokens-repo/pool:latest
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: 8090
+          protocol: TCP
+        env:
+        - name: POOL_ID
+          value: "pool-a"
+        - name: HEALTH_PORT
+          value: "8090"
+        - name: POOL_WORKER_COUNT
+          value: "2"
+        - name: LOG_FILE
+          value: ""          # stdout
+        - name: AMQP_HEARTBEAT
+          value: "0"
+        envFrom:
+        - configMapRef:
+            name: blockchain-config
+        - secretRef:
+            name: blockchain-secret
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "250m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8090
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8090
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2

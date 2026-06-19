@@ -1,0 +1,87 @@
+# Network Policies — Zero trust entre namespaces
+# Principio: cada namespace solo recibe tráfico de namespaces autorizados.
+
+---
+# Redis solo acepta conexiones desde el namespace blockchain
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-ingress
+  namespace: infra
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: blockchain
+    ports:
+    - port: 6379
+      protocol: TCP
+
+---
+# RabbitMQ solo acepta AMQP interno desde blockchain
+# (El tráfico AMQPS externo entra vía LoadBalancer y no pasa por NetworkPolicy)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rabbitmq-ingress
+  namespace: infra
+spec:
+  podSelector:
+    matchLabels:
+      app: rabbitmq
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: blockchain
+    ports:
+    - port: 5672
+      protocol: TCP
+    - port: 15672
+      protocol: TCP
+
+---
+# Blockchain: permite salida a infra (Redis + RabbitMQ) y a internet (Let's Encrypt, etc.)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: blockchain-egress
+  namespace: blockchain
+spec:
+  podSelector: {}   # todos los pods en blockchain
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: infra
+  - to:  # Acceso a internet (DNS, Let's Encrypt, Artifact Registry)
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.0.0.0/8     # excluir tráfico interno de GCP
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+
+---
+# Denegar tráfico entre pods dentro de infra (aislamiento lateral)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: infra-deny-inter-pod
+  namespace: infra
+spec:
+  podSelector: {}   # todos los pods en infra
+  policyTypes:
+  - Ingress
+  # Sin ingress rules explícitas = denegar todo tráfico que no tenga
+  # una NetworkPolicy que lo permita explícitamente (redis-ingress, rabbitmq-ingress)

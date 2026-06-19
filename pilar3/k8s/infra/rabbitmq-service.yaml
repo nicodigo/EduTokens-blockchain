@@ -1,0 +1,36 @@
+# RabbitMQ Service — LoadBalancer con IP fija
+# El puerto 5671 (AMQPS) es el único expuesto a internet.
+# Los puertos 5672 (AMQP) y 15672 (management) son accedidos internamente
+# o vía Ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: infra
+  labels:
+    app: rabbitmq
+  annotations:
+    # IP estática reservada vía OpenTofu (google_compute_address)
+    # Reemplazar con el output de tofu: $(tofu output -raw rabbitmq_static_ip)
+    # networking.gke.io/load-balancer-ip: "<RABBITMQ_STATIC_IP>"
+    # El cloud-controller de GKE asigna la IP automáticamente si está reservada
+    # con el mismo nombre en google_compute_address.
+spec:
+  type: LoadBalancer
+  # Descomentar cuando la IP esté reservada:
+  # loadBalancerIP: "<RABBITMQ_STATIC_IP>"
+  selector:
+    app: rabbitmq
+  ports:
+  - name: amqp
+    port: 5672
+    targetPort: 5672
+    protocol: TCP
+  - name: amqps
+    port: 5671
+    targetPort: 5671
+    protocol: TCP
+  - name: management
+    port: 15672
+    targetPort: 15672
+    protocol: TCP

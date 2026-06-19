@@ -1,0 +1,17 @@
+# Pool Service — ClusterIP interno
+apiVersion: v1
+kind: Service
+metadata:
+  name: pool-a
+  namespace: blockchain
+  labels:
+    app: pool-a
+spec:
+  type: ClusterIP
+  selector:
+    app: pool-a
+  ports:
+  - name: http
+    port: 8090
+    targetPort: 8090
+    protocol: TCP

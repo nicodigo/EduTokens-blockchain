@@ -1,0 +1,66 @@
+# NCT Deployment — Node Coordinator (singleton)
+# Solo debe existir UNA réplica. El NCT es el coordinador único de la blockchain.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nct
+  namespace: blockchain
+  labels:
+    app: nct
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # singleton: matar el viejo antes de crear el nuevo
+  selector:
+    matchLabels:
+      app: nct
+  template:
+    metadata:
+      labels:
+        app: nct
+        metrics: "enabled"
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+      - name: nct
+        image: us-central1-docker.pkg.dev/edutokens/edutokens-repo/nct:latest
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        env:
+        - name: PORT
+          value: "8080"
+        - name: LOG_FILE
+          value: ""          # stdout
+        - name: AMQP_HEARTBEAT
+          value: "0"
+        envFrom:
+        - configMapRef:
+            name: blockchain-config
+        - secretRef:
+            name: blockchain-secret
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "250m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2

@@ -1,0 +1,19 @@
+# Blockchain ConfigMap — parámetros de operación
+# Mismos valores que docker-compose.yml para consistencia.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blockchain-config
+  namespace: blockchain
+  labels:
+    app: blockchain
+data:
+  BLOCK_SIZE: "5"
+  BLOCK_TIMEOUT: "30"
+  DIFFICULTY: "4"
+  NONCE_SPACE: "1000000000"
+  RATE_LIMIT: "100/minute"
+  HEARTBEAT_TIMEOUT: "15.0"
+  AMQP_HEARTBEAT: "0"
+  # stdout — K8s recoge los logs automáticamente vía fluentd/Cloud Logging
+  LOG_FILE: ""
