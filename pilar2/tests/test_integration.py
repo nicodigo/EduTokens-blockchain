@@ -145,7 +145,7 @@ class TestTransactionSubmission(unittest.TestCase):
         self.assertIn("signature", resp.json()["error"].lower())
 
     def test_balance_endpoint_returns_structure(self):
-        """GET /balance/{address} returns expected JSON shape."""
+        """GET /balance/{pubkey} returns expected JSON shape."""
         from shared.crypto import pubkey_to_address
 
         client = MagicMock()
@@ -160,13 +160,14 @@ class TestTransactionSubmission(unittest.TestCase):
 
         app = create_health_app(state, client, config)
         with TestClient(app) as tc:
-            addr = pubkey_to_address(self.alice_pub)
-            resp = tc.get(f"/balance/{addr}")
+            # /balance/{pubkey} expects a raw 64-char pubkey, not a derived address
+            resp = tc.get(f"/balance/{self.alice_pub}")
             self.assertEqual(resp.status_code, 200)
             data = resp.json()
             self.assertIn("balance", data)
             self.assertIn("address", data)
             self.assertEqual(data["balance"], 5000)
+            self.assertEqual(data["address"], pubkey_to_address(self.alice_pub))
 
     def test_account_endpoint_returns_nonce_and_discarded(self):
         """GET /account/{pubkey} returns nonce and discarded_transactions."""
@@ -184,13 +185,15 @@ class TestTransactionSubmission(unittest.TestCase):
 
         app = create_health_app(state, client, config)
         with TestClient(app) as tc:
-            addr = pubkey_to_address(self.alice_pub)
-            resp = tc.get(f"/account/{addr}")
+            # /account/{pubkey} expects a raw 64-char pubkey, not a derived address
+            resp = tc.get(f"/account/{self.alice_pub}")
             self.assertEqual(resp.status_code, 200)
             data = resp.json()
             self.assertIn("nonce", data)
             self.assertIn("discarded_transactions", data)
+            self.assertIn("address", data)
             self.assertIsInstance(data["discarded_transactions"], list)
+            self.assertEqual(data["address"], pubkey_to_address(self.alice_pub))
 
 
 if __name__ == "__main__":

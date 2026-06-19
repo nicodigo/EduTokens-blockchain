@@ -598,7 +598,7 @@ class TestDiscardedTransactionPersistence(unittest.TestCase):
     def test_discarded_included_in_account_endpoint(self):
         from fastapi.testclient import TestClient
 
-        pubkey = "b" * 24  # 24-char hex for AccountResponse.address validation
+        pubkey = "b" * 64  # raw 64-char Ed25519 pubkey (endpoint expects pubkey, not address)
         client = MagicMock()
         # get() is called for balance:pubkey and nonce:pubkey
         get_vals: dict[str, bytes | None] = {

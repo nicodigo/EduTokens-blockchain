@@ -205,29 +205,51 @@ class TestWorkerResultAckHandling(unittest.TestCase):
 
 
 class TestPoolNctHeartbeat(unittest.TestCase):
-    """Audit H2 corrected: pool registers as a worker with the NCT."""
+    """Audit H2 corrected: pool registers as a worker with the NCT.
+
+    The ``_nct_heartbeat_loop`` creates its OWN RabbitMQ connection
+    (thread-safety requirement — pika.BlockingConnection is not shared
+    across threads).  We mock ``broker.broker.get_connection`` so the
+    loop never touches a real broker.
+    """
 
     def setUp(self):
+        # Mock the connection that _nct_heartbeat_loop creates internally.
+        # pool.py imports get_connection with `from broker.broker import`,
+        # creating a local reference — we must patch the name in pool.pool.
+        self._mock_conn_patcher = patch("pool.pool.get_connection")
+        self._mock_conn = self._mock_conn_patcher.start()
+        self._mock_props_patcher = patch("pool.pool.persistent_props")
+        self._mock_props = self._mock_props_patcher.start()
+
+        self._mock_channel = MagicMock()
+        self._mock_conn.return_value.channel.return_value = self._mock_channel
+        self._mock_conn.return_value.is_open = True
+        self._mock_channel.is_open = True
+
         self.pool = PoolCoordinator(
             pool_id="pool-corrected",
             rmq_url="amqp://fake",
             worker_count=2,
         )
-        self.pool._channel = MagicMock()
         # Shorter interval for testing
         self.pool._nct_heartbeat_interval = 0.01
         self.pool._shutdown.clear()
 
+    def tearDown(self):
+        self._mock_conn_patcher.stop()
+        self._mock_props_patcher.stop()
+
     def test_heartbeat_publishes_to_worker_routing_key(self):
         """Pool heartbeat must use routing key worker.{pool_id}, not worker.*.*"""
         # Run one heartbeat iteration (kill after first publish)
-        self.pool._channel.basic_publish.side_effect = (
+        self._mock_channel.basic_publish.side_effect = (
             lambda **kw: self.pool._shutdown.set() or None  # stop after first
         )
         self.pool._nct_heartbeat_loop()
 
-        self.pool._channel.basic_publish.assert_called_once()
-        call_kw = self.pool._channel.basic_publish.call_args[1]
+        self._mock_channel.basic_publish.assert_called_once()
+        call_kw = self._mock_channel.basic_publish.call_args[1]
         self.assertEqual(call_kw["exchange"], "blockchain")
         self.assertEqual(call_kw["routing_key"], "worker.pool-corrected")
 
@@ -249,7 +271,7 @@ class TestPoolNctHeartbeat(unittest.TestCase):
             self.pool._shutdown.set()  # stop after second attempt
             return None
 
-        self.pool._channel.basic_publish.side_effect = _fail_once
+        self._mock_channel.basic_publish.side_effect = _fail_once
         self.pool._nct_heartbeat_loop()  # must not raise
 
         # Second call succeeded
@@ -267,12 +289,28 @@ class TestMonitorRepublishWithoutOverlap(unittest.TestCase):
     working on their old sub-ranges while receiving new overlapping tasks."""
 
     def setUp(self) -> None:
+        # _monitor_loop creates its OWN pika connection — mock it.
+        # pool.py imports get_connection with `from broker.broker import`.
+        self._mock_conn_patcher = patch("pool.pool.get_connection")
+        self._mock_conn = self._mock_conn_patcher.start()
+        self._mock_props_patcher = patch("pool.pool.persistent_props")
+        self._mock_props = self._mock_props_patcher.start()
+
+        self._mock_channel = MagicMock()
+        self._mock_conn.return_value.channel.return_value = self._mock_channel
+        self._mock_conn.return_value.is_open = True
+        self._mock_channel.is_open = True
+
         self.pool = PoolCoordinator(
             pool_id="test-pool", rmq_url="amqp://fake", worker_count=3,
         )
         self.pool._channel = MagicMock()
         self.pool._monitor_interval = 0.01  # fast polling for test
         self.pool._result_timeout = 999  # don't trigger timeout
+
+    def tearDown(self) -> None:
+        self._mock_conn_patcher.stop()
+        self._mock_props_patcher.stop()
 
     def test_abort_called_before_republish_on_worker_death(self):
         """M1: When worker count drops, _broadcast_abort must be called
@@ -330,11 +368,27 @@ class TestMonitorGenerationReplacement(unittest.TestCase):
     is still alive for a few milliseconds after the previous block finished."""
 
     def setUp(self) -> None:
+        # _monitor_loop creates its OWN pika connection — mock it.
+        # pool.py imports get_connection with `from broker.broker import`.
+        self._mock_conn_patcher = patch("pool.pool.get_connection")
+        self._mock_conn = self._mock_conn_patcher.start()
+        self._mock_props_patcher = patch("pool.pool.persistent_props")
+        self._mock_props = self._mock_props_patcher.start()
+
+        self._mock_channel = MagicMock()
+        self._mock_conn.return_value.channel.return_value = self._mock_channel
+        self._mock_conn.return_value.is_open = True
+        self._mock_channel.is_open = True
+
         self.pool = PoolCoordinator(
             pool_id="test-pool", rmq_url="amqp://fake", worker_count=2,
         )
         self.pool._channel = MagicMock()
         self.pool._monitor_interval = 0.01  # fast polling for test
+
+    def tearDown(self) -> None:
+        self._mock_conn_patcher.stop()
+        self._mock_props_patcher.stop()
 
     def test_new_task_starts_fresh_monitor(self):
         """H1: _on_mining_task must always create a new monitor thread,
