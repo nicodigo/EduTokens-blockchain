@@ -5,10 +5,9 @@
 resource "google_project_service" "services" {
   for_each = toset([
     "container.googleapis.com",          # GKE
-    "compute.googleapis.com",             # VPC, firewalls, IPs
+    "compute.googleapis.com",             # VPC, firewalls, IP estática
     "artifactregistry.googleapis.com",    # Docker images
     "iam.googleapis.com",                 # Workload Identity
-    "certificatemanager.googleapis.com",  # cert-manager
     "cloudresourcemanager.googleapis.com",# IAM bindings
   ])
 
@@ -72,4 +71,6 @@ resource "google_compute_address" "rabbitmq" {
   region       = var.region
   address_type = "EXTERNAL"
   network_tier = "STANDARD"  # free tier: STANDARD tier es más barato
+
+  depends_on = [google_project_service.services]  # garantiza compute.googleapis.com activa
 }

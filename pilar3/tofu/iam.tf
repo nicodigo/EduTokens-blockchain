@@ -6,6 +6,8 @@ resource "google_service_account" "gke_pull" {
   account_id   = "gke-pull-images"
   display_name = "GKE Artifact Registry Puller"
   project      = var.project_id
+
+  depends_on = [google_project_service.services]  # garantiza iam.googleapis.com activa
 }
 
 # Permiso de lectura sobre el repositorio Docker
@@ -28,6 +30,8 @@ resource "google_service_account" "github_actions" {
   account_id   = "github-actions"
   display_name = "GitHub Actions CI/CD"
   project      = var.project_id
+
+  depends_on = [google_project_service.services]  # garantiza iam.googleapis.com activa
 }
 
 # Permiso para pushear imágenes desde CI
