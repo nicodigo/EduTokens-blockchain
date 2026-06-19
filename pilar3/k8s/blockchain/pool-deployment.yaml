@@ -19,10 +19,11 @@ spec:
         app: pool-a
         metrics: "enabled"
     spec:
+      serviceAccountName: blockchain
       terminationGracePeriodSeconds: 10
       containers:
       - name: pool-a
-        image: us-central1-docker.pkg.dev/edutokens/edutokens-repo/pool:latest
+        image: us-central1-docker.pkg.dev/edutokens-2026/edutokens-repo/pool:latest
         imagePullPolicy: Always
         ports:
         - name: http

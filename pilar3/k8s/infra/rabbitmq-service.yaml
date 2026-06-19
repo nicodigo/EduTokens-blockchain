@@ -18,7 +18,7 @@ metadata:
 spec:
   type: LoadBalancer
   # Descomentar cuando la IP esté reservada:
-  # loadBalancerIP: "<RABBITMQ_STATIC_IP>"
+  loadBalancerIP: "35.208.99.193"
   # Restringir AMQPS (puerto 5671) al cluster GPU del profesor
   # Cuando se conozcan los CIDRs, reemplazar 0.0.0.0/0
   loadBalancerSourceRanges:

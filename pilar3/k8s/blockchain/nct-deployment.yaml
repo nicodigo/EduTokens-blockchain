@@ -20,10 +20,11 @@ spec:
         app: nct
         metrics: "enabled"
     spec:
+      serviceAccountName: blockchain
       terminationGracePeriodSeconds: 15
       containers:
       - name: nct
-        image: us-central1-docker.pkg.dev/edutokens/edutokens-repo/nct:latest
+        image: us-central1-docker.pkg.dev/edutokens-2026/edutokens-repo/nct:latest
         imagePullPolicy: Always
         ports:
         - name: http
