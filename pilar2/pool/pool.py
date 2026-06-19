@@ -413,9 +413,11 @@ class PoolCoordinator:
     # Abort
     # ------------------------------------------------------------------
 
-    def _broadcast_abort(self, task_id: str) -> None:
+    def _broadcast_abort(self, task_id: str, channel: Any = None) -> None:
+        """Broadcast an abort signal.  Uses *channel* if given, else self._channel."""
+        ch = channel if channel is not None else self._channel
         msg = ControlMessage(action="abort", task_id=task_id)
-        self._channel.basic_publish(
+        ch.basic_publish(
             exchange=EXCHANGE,
             routing_key=f"pool.{self.pool_id}.control",
             body=msg.to_json(),
@@ -441,14 +443,23 @@ class PoolCoordinator:
         generation (because a new task arrived and a fresher monitor
         replaced this one), the loop exits immediately — closing the
         TOCTOU race documented in audit H1.
+
+        Uses its OWN connection — pika.BlockingConnection is not thread-safe
+        and the main thread is blocked in start_consuming().
         """
+        # Own connection so we don't corrupt the main consume thread's AMQP stream.
+        # Also disable AMQP heartbeat — this loop sleeps between iterations.
+        _mon_url = self.rmq_url + ("&" if "?" in self.rmq_url else "?") + "heartbeat=0"
+        mon_conn = get_connection(url=_mon_url)
+        mon_ch = mon_conn.channel()
+
         start = time.time()
         while self._monitor_active.is_set() and self._monitor_generation == generation:
             self._monitor_active.wait(timeout=self._monitor_interval)
             if not self._monitor_active.is_set():
-                return
+                break
             if self._monitor_generation != generation:
-                return  # superseded by a newer monitor (audit H1)
+                break  # superseded by a newer monitor (audit H1)
 
             # M2: snapshot mining context under lock for this iteration.
             with self._mining_lock:
@@ -460,7 +471,7 @@ class PoolCoordinator:
 
             # Already forwarded a result for this block?
             if current_block is None:
-                return
+                break
 
             active = self._get_active_worker_count()
             elapsed = time.time() - start
@@ -475,11 +486,11 @@ class PoolCoordinator:
                 # M1: abort surviving workers before republishing so they
                 # discard their old (now-overlapping) sub-ranges cleanly.
                 if active > 0:
-                    self._broadcast_abort(current_task_id)
+                    self._broadcast_abort(current_task_id, channel=mon_ch)
                 if active > 0 or self._worker_count_fallback > 0:
                     count = active if active > 0 else self._worker_count_fallback
                     publish_tasks(
-                        self._channel,
+                        mon_ch,
                         block_index=current_block,
                         fingerprint=current_fingerprint,
                         difficulty=current_difficulty,
@@ -490,7 +501,7 @@ class PoolCoordinator:
                     self._original_worker_count = count
                 else:
                     # No workers left at all — signal NCT
-                    self._channel.basic_publish(
+                    mon_ch.basic_publish(
                         exchange=EXCHANGE,
                         routing_key=f"pool.{self.pool_id}.status",
                         body=json.dumps({
@@ -501,7 +512,7 @@ class PoolCoordinator:
                         }, sort_keys=True),
                         properties=persistent_props(),
                     )
-                    return  # no workers left, stop monitoring
+                    break  # no workers left, stop monitoring
 
             elif elapsed > self._result_timeout:
                 logger.warning(
@@ -509,6 +520,12 @@ class PoolCoordinator:
                     "Waiting for NCT timeout + range expansion.",
                     current_block, elapsed, active,
                 )
+
+        # Close the monitor's connection cleanly
+        try:
+            mon_conn.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Health
@@ -529,10 +546,23 @@ class PoolCoordinator:
 
         Uses routing key ``worker.{pool_id}`` so the NCT's
         ``worker_registry`` queue receives it via the ``worker.#`` binding.
+
+        Uses its OWN connection — pika.BlockingConnection is not thread-safe
+        and the main thread is blocked in start_consuming().
         """
+        hb_conn: Any = None
+        hb_ch: Any = None
+        # Disable AMQP heartbeat — this loop sleeps 30 s between iterations
+        # so protocol-level heartbeats would always time out.
+        _hb_url = self.rmq_url + ("&" if "?" in self.rmq_url else "?") + "heartbeat=0"
+
         while not self._shutdown.wait(timeout=self._nct_heartbeat_interval):
             try:
-                self._channel.basic_publish(
+                if hb_conn is None or not hb_conn.is_open \
+                        or hb_ch is None or not hb_ch.is_open:
+                    hb_conn = get_connection(url=_hb_url)
+                    hb_ch = hb_conn.channel()
+                hb_ch.basic_publish(
                     exchange=EXCHANGE,
                     routing_key=f"worker.{self.pool_id}",
                     body=json.dumps({
@@ -544,9 +574,11 @@ class PoolCoordinator:
                 )
             except Exception:
                 logger.debug(
-                    "Pool %s NCT heartbeat failed — channel may be reconnecting",
+                    "Pool %s NCT heartbeat failed — reconnecting",
                     self.pool_id,
                 )
+                hb_ch = None
+                hb_conn = None
 
 
 # ---------------------------------------------------------------------------

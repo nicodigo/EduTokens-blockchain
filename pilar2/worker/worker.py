@@ -252,25 +252,32 @@ class WorkerService:
         )
 
     def _heartbeat_loop(self) -> None:
-        # Use a dedicated channel on the shared connection (audit L2).
-        # pika allows multiple channels per connection as long as each
-        # channel is used from a single thread — which is the case here.
+        # OWN connection — pika.BlockingConnection is NOT thread-safe.
+        # Sharing self._connection with the main consume thread causes
+        # AMQP frame corruption (frame_too_large, tx buffer underflow).
+        hb_connection: Any = None
         hb_channel: Any = None
+        # Disable AMQP heartbeat — application-level heartbeat is sufficient
+        # and the 5 s sleep between iterations risks AMQP heartbeat timeouts.
+        _hb_url = self.rmq_url + ("&" if "?" in self.rmq_url else "?") + "heartbeat=0"
 
         while not self._shutdown.is_set():
             self._shutdown.wait(timeout=self.heartbeat_interval)
             if self._shutdown.is_set():
                 break
             try:
-                # Get or refresh the heartbeat channel
-                if hb_channel is None or not hb_channel.is_open:
-                    hb_channel = self._connection.channel()
+                # Get or refresh the heartbeat connection + channel
+                if hb_connection is None or not hb_connection.is_open \
+                        or hb_channel is None or not hb_channel.is_open:
+                    hb_connection = get_connection(url=_hb_url)
+                    hb_channel = hb_connection.channel()
                 self._send_heartbeat(hb_channel)
             except Exception:
                 logger.warning(
                     "Worker %s heartbeat send failed — will retry", self.worker_id,
                 )
-                hb_channel = None  # force refresh on next iteration
+                hb_channel = None
+                hb_connection = None  # force full refresh on next iteration
 
     # ------------------------------------------------------------------
     # Registration (audit M3)

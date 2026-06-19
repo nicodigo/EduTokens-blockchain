@@ -420,6 +420,8 @@ def result_loop(
     """Thread 2 — poll mining results and worker registry, verify PoW, persist blocks."""
     logger.info("Result loop started")
 
+    idle_ms = 100  # initial backoff (audit L2)
+
     while not state.shutdown.is_set():
         # Ensure RabbitMQ is alive before any poll (audit H2)
         _ensure_rabbitmq_alive(conn_ref, ch_ref, rmq_url)
@@ -721,21 +723,20 @@ def main() -> None:
     ensure_genesis(redis_client)
 
     # ---- RabbitMQ ----
-    rmq_conn = get_connection(url=config.rabbitmq_url)
-    # Audit C1: BlockingChannel is NOT thread-safe.  Create one channel per
-    # thread — block_loop publishes mining tasks, result_loop consumes
-    # results and polls the worker registry.  Sharing a single channel
-    # across threads causes AMQP frame corruption under load.
-    block_channel = rmq_conn.channel()
-    result_channel = rmq_conn.channel()
+    # Each thread gets its OWN connection + channel.
+    # pika.BlockingConnection is NOT thread-safe — sharing one connection
+    # across threads (even through separate channels) causes AMQP frame
+    # corruption under load (tx buffer underflow, frame_too_large, etc.).
+    block_conn = get_connection(url=config.rabbitmq_url)
+    result_conn = get_connection(url=config.rabbitmq_url)
+    block_channel = block_conn.channel()
+    result_channel = result_conn.channel()
     declare_topology(block_channel)  # queues/exchanges — idempotent
+    # result_channel will declare topology on first use via _ensure_rabbitmq_alive
 
-    # Each thread gets its own (conn_ref, ch_ref) pair so reconnection
-    # is independent — one thread reconnecting does not invalidate the
-    # other's channel.
-    block_conn_ref: list[Any] = [rmq_conn]
+    block_conn_ref: list[Any] = [block_conn]
     block_ch_ref: list[Any] = [block_channel]
-    result_conn_ref: list[Any] = [rmq_conn]
+    result_conn_ref: list[Any] = [result_conn]
     result_ch_ref: list[Any] = [result_channel]
 
     # ---- Shared state ----
