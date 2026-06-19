@@ -613,19 +613,23 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
         save_pending_tx(redis_client, t)
         return TransactionResponse(tx_id=t.tx_id)
 
-    @app.get("/balance/{address}", response_model=BalanceResponse)
-    def get_balance_for_address(address: str) -> BalanceResponse:
-        balance = get_balance(redis_client, address)
-        return BalanceResponse(address=address, balance=balance)
+    @app.get("/balance/{pubkey}", response_model=BalanceResponse)
+    def get_balance_for_address(pubkey: str) -> BalanceResponse:
+        from shared.crypto import pubkey_to_address
+
+        balance = get_balance(redis_client, pubkey)
+        return BalanceResponse(address=pubkey_to_address(pubkey), balance=balance)
 
     @app.get("/account/{pubkey}", response_model=AccountResponse)
     def get_account(pubkey: str) -> AccountResponse:
         """Return balance, nonce, and discarded transaction ids (audit M2)."""
+        from shared.crypto import pubkey_to_address
+
         balance = get_balance(redis_client, pubkey)
         nonce = get_nonce(redis_client, pubkey)
         discarded = get_discarded_txns(redis_client, pubkey)
         return AccountResponse(
-            address=pubkey,
+            address=pubkey_to_address(pubkey),
             balance=balance,
             nonce=nonce,
             discarded_transactions=discarded,

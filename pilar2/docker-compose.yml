@@ -46,7 +46,7 @@ services:
       - PORT=8080
       - LOG_FILE=/var/log/nct.log
       - RATE_LIMIT=100/minute
-      - AUTHORITY_PUBKEY=
+      - AUTHORITY_PUBKEY=${AUTHORITY_PUBKEY}
       - AMQP_HEARTBEAT=0
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]

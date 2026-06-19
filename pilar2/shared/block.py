@@ -45,14 +45,18 @@ class Transaction:
 
     def _signing_dict(self) -> dict[str, Any]:
         """Fields that are signed.  ``signature`` is excluded so that
-        ``tx_id = SHA-256(signing_dict)`` is computable *before* signing."""
+        ``tx_id = SHA-256(signing_dict)`` is computable *before* signing.
+
+        ``timestamp`` is deliberately excluded — it is set server-side on
+        arrival and the client cannot predict ``time.time()`` on the NCT.
+        ``nonce`` provides replay protection.
+        """
         return {
             "sender_pubkey": self.sender_pubkey,
             "receiver_pubkey": self.receiver_pubkey,
             "amount": self.amount,
             "tx_type": self.tx_type,
             "concept": self.concept,
-            "timestamp": self.timestamp,
             "nonce": self.nonce,
         }
 
@@ -73,7 +77,8 @@ class Transaction:
 
     def to_dict(self) -> dict[str, Any]:
         """Full serialisation, **including** the signature (for storage)."""
-        d = self._signing_dict()  # already includes nonce
+        d = self._signing_dict()  # nonce, no timestamp
+        d["timestamp"] = self.timestamp
         d["signature"] = self.signature
         return d
 
