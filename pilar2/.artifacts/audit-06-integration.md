@@ -6,6 +6,8 @@
 
 **Note:** This phase analyses how components interact. Findings from P1–P5 are cross-referenced where relevant; new findings are those only visible at the integration level.
 
+**Status:** FIXED
+
 ---
 
 ## Findings

@@ -6,6 +6,8 @@
 
 **Note:** This phase synthesises cross-component patterns. Findings already documented in P1–P4 are cross-referenced, not duplicated.
 
+**Status:** FIXED
+
 ---
 
 ## Findings
