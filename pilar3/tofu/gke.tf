@@ -99,16 +99,11 @@ resource "google_container_node_pool" "infra_apps" {
   }
 }
 
-# --- Kubernetes Service Accounts para Workload Identity ---
-# KSA "blockchain" en namespace "blockchain"
-resource "kubernetes_service_account" "blockchain" {
-  metadata {
-    name      = "blockchain"
-    namespace = "blockchain"
-    annotations = {
-      "iam.gke.io/gcp-service-account" = google_service_account.gke_pull.email
-    }
-  }
-
-  depends_on = [google_container_node_pool.infra_apps]
-}
+# ── NOTA: Kubernetes Service Account ──────────────────────────────
+# La KSA "blockchain" con Workload Identity se crea con kubectl:
+#   kubectl apply -f pilar3/k8s/blockchain/service-account.yaml
+#
+# La anotación iam.gke.io/gcp-service-account apunta a:
+#   ${google_service_account.gke_pull.email}
+# (ver output "gke_pull_service_account" después de tofu apply)
+# ───────────────────────────────────────────────────────────────────

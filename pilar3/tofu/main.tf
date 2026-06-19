@@ -4,25 +4,9 @@ provider "google" {
   region  = var.region
 }
 
-# Datos del cliente para kubernetes y helm providers
-data "google_client_config" "default" {}
-
-# Provider de Kubernetes — apunta al cluster GKE una vez creado
-provider "kubernetes" {
-  host  = "https://${google_container_cluster.primary.endpoint}"
-  token = data.google_client_config.default.access_token
-  cluster_ca_certificate = base64decode(
-    google_container_cluster.primary.master_auth[0].cluster_ca_certificate
-  )
-}
-
-# Provider de Helm — para instalar cert-manager y nginx-ingress
-provider "helm" {
-  kubernetes {
-    host  = "https://${google_container_cluster.primary.endpoint}"
-    token = data.google_client_config.default.access_token
-    cluster_ca_certificate = base64decode(
-      google_container_cluster.primary.master_auth[0].cluster_ca_certificate
-    )
-  }
-}
+# ── NOTA ───────────────────────────────────────────────────────────
+# Kubernetes y Helm NO se manejan desde OpenTofu.
+# Después de tofu apply, ejecutar los pasos manuales detallados en
+# pilar3/README.md o en la sección "Post-tofu setup" de este archivo.
+# Esto evita el chicken-and-egg problem del provider de Kubernetes.
+# ───────────────────────────────────────────────────────────────────

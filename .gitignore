@@ -1,79 +1,131 @@
+# ============================================================================
+# .gitignore — EduTokens Blockchain
+# ============================================================================
+
+# ── Secrets & Environment (NEVER commit) ────────────────────────────────────
+.env
+.env.*
+!.env.example
+secrets.json
+credentials.json
+*.pem
+*.key
+!test_*.pem
+!test_*.key
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+*.manifest
+*.spec
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+nosetests.xml
+.mutants/
+.ipynb_checkpoints
+.python-version
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ── OpenTofu / Terraform ────────────────────────────────────────────────────
+# Directorio de trabajo local (contiene providers descargados)
+**/.terraform/
+
+# Archivos de estado (contienen datos sensibles)
+*.tfstate
+*.tfstate.*
+*.tfplan
+
+# Logs de crash
+crash.log
+crash.*.log
+
+# Archivos de override (se cargan automáticamente)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# CLI config file (puede contener credenciales)
+.terraformrc
+terraform.rc
+
+# terraform.tfvars puede contener datos sensibles (email, IPs)
+# El template terraform.tfvars.example sí se commitea.
+pilar3/tofu/terraform.tfvars
+
+# ── Kubernetes ───────────────────────────────────────────────────────────────
+# Kubeconfigs locales
+*.kubeconfig
+.kube/
+
+# Helm charts descargados (no usamos Helm en este proyecto, pero por las dudas)
+charts/
+
+# Secretos de Kubernetes con valores reales (se gitignoran)
+# Los templates con placeholders usan extensión .example (se commitean)
+pilar3/k8s/**/*secret*.yaml
+!pilar3/k8s/**/*.yaml.example
+
+# ── Docker ───────────────────────────────────────────────────────────────────
+# Imágenes exportadas
+*.tar
+*.tar.gz
+docker-compose.override.yml
+
+# ── CUDA / GPU ───────────────────────────────────────────────────────────────
+# Binarios compilados de CUDA
 *.i
 *.ii
 *.gpu
 *.ptx
 *.cubin
 *.fatbin
+*.o
 
-# Environment files
-.env
-
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# C extensions
-*.so
-
-# Distribution / packaging
-bin/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Jupyter Notebooks
-.ipynb_checkpoints
-
-# Virtual Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Environment variables and secrets (NEVER commit these)
-.env
-.env.*
-!.env.example
-secrets.json
-
-# Unit test / coverage reports
-htmlcov/
-.toml
-.tox/
-.nosexml
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.mutants/
-.pytest_cache/
-.ruff_cache/
-
-# IDEs and Editors
+# ── IDEs & Editors ───────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
+*.swn
 .project
 .pydevproject
+*.sublime-project
+*.sublime-workspace
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.bak
+*~
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+!pilar2/**/*.log.example
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+node_modules/
+vendor/

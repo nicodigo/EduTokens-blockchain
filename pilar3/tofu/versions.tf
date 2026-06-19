@@ -1,5 +1,5 @@
 # OpenTofu — Providers y versiones
-# Free tier GCP: 8 vCPUs en us-central1, PD standard, cluster zonal
+# Solo Google Cloud. Kubernetes y Helm se manejan con kubectl (más simple, más claro).
 
 terraform {
   required_version = ">= 1.6.0"
@@ -8,18 +8,6 @@ terraform {
     google = {
       source  = "hashicorp/google"
       version = "~> 6.0"
-    }
-    kubernetes = {
-      source  = "hashicorp/kubernetes"
-      version = "~> 2.30"
-    }
-    helm = {
-      source  = "hashicorp/helm"
-      version = "~> 2.15"
-    }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.6"
     }
   }
 

@@ -1,4 +1,4 @@
-# Outputs — valores necesarios para CI/CD y deploys manuales
+# Outputs — valores necesarios para CI/CD y comandos post-tofu
 
 output "project_id" {
   description = "Project ID"
@@ -18,18 +18,6 @@ output "zone" {
 output "cluster_name" {
   description = "Nombre del cluster GKE"
   value       = google_container_cluster.primary.name
-}
-
-output "cluster_endpoint" {
-  description = "Endpoint del plano de control de GKE"
-  value       = google_container_cluster.primary.endpoint
-  sensitive   = true
-}
-
-output "cluster_ca_certificate" {
-  description = "CA certificate del cluster (base64)"
-  value       = google_container_cluster.primary.master_auth[0].cluster_ca_certificate
-  sensitive   = true
 }
 
 output "rabbitmq_static_ip" {
@@ -60,4 +48,9 @@ output "subnet_name" {
 output "get_credentials_command" {
   description = "Comando para obtener credenciales kubectl"
   value       = "gcloud container clusters get-credentials ${var.cluster_name} --zone ${var.zone} --project ${var.project_id}"
+}
+
+output "gke_pull_service_account" {
+  description = "Email de la service account GCP para Workload Identity (usar en la anotación de KSA)"
+  value       = google_service_account.gke_pull.email
 }
