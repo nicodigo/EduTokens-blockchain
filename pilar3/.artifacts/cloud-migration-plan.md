@@ -2,7 +2,7 @@
 
 > **Proyecto:** EduTokens — Blockchain Distribuida y CUDA  
 > **Curso:** Sistemas Distribuidos y Programación Paralela (SDyPP) — UNLu  
-> **Última actualización:** 2026-06-20 (post-sesión: dominio propio, certbot, worker GPU, transacción minada)  
+> **Última actualización:** 2026-06-20 (sesión 2: fixes de StreamLostError, MinerError, Pool auto_ack, nonce en cmd_earn, .decode en get_discarded_txns)  
 > **Deadline entrega:** 2026-06-23
 
 ---
@@ -15,9 +15,9 @@
 | Fase 2 — Infraestructura (OpenTofu) | ✅ aplicado |
 | Fase 3 — Manifiestos Kubernetes | ✅ funcionando |
 | Fase 4 — Workers GPU | ✅ desplegado, conectado, minado validado |
-| Fase 5 — CI/CD | ⏳ pendiente |
+| Fase 5 — CI/CD | ⏳ pendiente (GitHub Actions WIP + Workload Identity Pool) |
 | Fase 6 — Observabilidad | 📎 diferida |
-| Fase 7 — Verificación | 🔶 parcial (bloque 1 minado; conexión AMQP se corta post-minado — bug en NCT block_loop) |
+| Fase 7 — Verificación | 🔶 parcial (bloque 2 creado con 1 tx; timeout de minado por pool caída infinita — necesita nuevo deploy con fixes) |
 
 ---
 
@@ -216,12 +216,24 @@ Workload Identity para GitHub Actions provisionado en `iam.tf`. Falta crear Work
 
 ## Fase 7 — Verificación 🔶
 
-**Parcial.** Bloque génesis + bloque 1 con 1 transacción minado por worker GPU.
+**Parcial.** Bloque génesis + bloque 1 (minado) + bloque 2 (creado con 1 EARN tx). El bloque 2 no se minó porque la pool entraba en loop infinito de reconexión al recibir resultados de workers.
+
+**Fixes aplicados en esta sesión:**
+
+| Fix | Archivos | Estado |
+|---|---|---|
+| NCT `StreamLostError` crash al publicar bloque | `nct/nct.py` — try/except con reconexión en `publish_mining_task` + `basic_get` | ✅ Implementado, necesita rebuild + redeploy |
+| Worker `MinerError: empty stdout` — requeue infinito | `miner/miner.py` — stderr a ERROR + incluido en error msg; `worker/worker.py` — dead-letter en vez de requeue | ✅ Implementado, necesita rebuild + redeploy |
+| Pool `PRECONDITION_FAILED` loop infinito en reconexión | `pool/pool.py` — `auto_ack=True` → `False` en results consumer de reconexión | ✅ Implementado, necesita rebuild + redeploy |
+| `send_test_tx.py earn` siempre usaba nonce=0 | `tools/send_test_tx.py` — `cmd_earn` ahora consulta `/account/{pubkey}` para nonce | ✅ Implementado, necesita rebuild |
+| `get_discarded_txns` crashea con `decode_responses=True` | `storage/chain_store.py` — eliminar `.decode()` | ✅ Implementado, necesita rebuild |
 
 **Pendiente:**
-1. Arreglar `StreamLostError` en NCT al publicar bloque por inactividad AMQP durante minado
-2. `pilar3/README.md`
-3. Video de demostración
+1. Rebuild y push de NCT + Pool + Worker-GPU
+2. Purge de colas viejas en RabbitMQ
+3. `pilar3/README.md`
+4. Video de demostración
+5. CI/CD (`.github/workflows/`)
 
 ---
 
@@ -231,8 +243,11 @@ Workload Identity para GitHub Actions provisionado en `iam.tf`. Falta crear Work
 |---|---|
 | Workers no validan TLS | ✅ Resuelto — certbot wildcard en trust store Ubuntu |
 | Rate limits GCP Free Trial | ⚠️ Monitorear (4 vCPUs, PD standard) |
-| Tiempo | ⚠️ 3 días restantes |
-| Conexión AMQP idle durante minado | ⚠️ Bug en NCT block_loop — reconexión automática |
+| Tiempo | ⚠️ 2 días restantes |
+| Conexión AMQP idle durante minado | ✅ Fix implementado (try/except + reconexión en NCT block_loop y result_loop) |
+| Pool loop infinito en reconexión | ✅ Fix implementado (`auto_ack=False` en results consumer) |
+| Worker requeue infinito en MinerError | ✅ Fix implementado (dead-letter en vez de requeue) |
+| Binary CUDA falla silenciosamente | ✅ Fix implementado (stderr a ERROR + incluido en MinerError) |
 
 ---
 

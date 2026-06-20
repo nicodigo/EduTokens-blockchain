@@ -238,7 +238,8 @@ def add_discarded_tx(client: Any, pubkey: str, tx_id: str) -> None:
 def get_discarded_txns(client: Any, pubkey: str) -> list[str]:
     """Return tx_ids discarded for *pubkey*, newest first."""
     raw = client.smembers(f"{DISCARDED_PREFIX}{pubkey}")
-    return [tid.decode() for tid in raw]
+    # decode_responses=True → smembers already returns str
+    return list(raw)
 
 
 def update_balances_from_block(client: Any, block: Block) -> None:

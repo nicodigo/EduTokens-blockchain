@@ -8,8 +8,10 @@ from shared.block import Block, Transaction
 from storage.chain_store import (
     BLOCKS_KEY,
     PENDING_TXS_KEY,
+    add_discarded_tx,
     get_block,
     get_chain_height,
+    get_discarded_txns,
     get_latest_block,
     restore_pending_txs,
     save_block,
@@ -393,6 +395,61 @@ class TestPendingTxPersistence(unittest.TestCase):
         restored = restore_pending_txs(client)
         self.assertEqual(len(restored), 1)
         self.assertEqual(restored[0].tx_id, tx.tx_id)
+
+
+# ---------------------------------------------------------------------------
+# Discarded transaction tracking (audit M2)
+# ---------------------------------------------------------------------------
+
+DISCARDED_PREFIX = "blockchain:discarded:"
+
+
+class TestDiscardedTransactions(unittest.TestCase):
+    """get_discarded_txns and add_discarded_tx work with decode_responses=True."""
+
+    def setUp(self) -> None:
+        self.pubkey = "aad94d792c20a07a4e7f338ba9e642cb890b94aa7faedabfe3f135a50f36fbfb"
+
+    def test_add_and_get_discarded_txns_with_decode_responses_true(self):
+        """When Redis returns str (decode_responses=True), get_discarded_txns
+        must return list[str] without calling .decode()."""
+        client = MagicMock()
+        client.smembers.return_value = {"tx-abc123", "tx-def456"}
+
+        result = get_discarded_txns(client, self.pubkey)
+
+        self.assertEqual(result, ["tx-abc123", "tx-def456"])
+        client.smembers.assert_called_once_with(
+            f"{DISCARDED_PREFIX}{self.pubkey}"
+        )
+        # Must NOT call .decode() on any element
+        for elem in result:
+            self.assertIsInstance(elem, str)
+            with self.assertRaises(AttributeError):
+                elem.decode()  # str has no decode
+
+    def test_get_discarded_txns_returns_empty_list_when_none(self):
+        client = MagicMock()
+        client.smembers.return_value = set()
+        self.assertEqual(get_discarded_txns(client, self.pubkey), [])
+
+    def test_add_discarded_tx_calls_sadd(self):
+        client = MagicMock()
+        add_discarded_tx(client, self.pubkey, "tx-ghi789")
+        client.sadd.assert_called_once_with(
+            f"{DISCARDED_PREFIX}{self.pubkey}", "tx-ghi789"
+        )
+
+    def test_get_discarded_txns_not_called_with_decode(self):
+        """Regression: ensure .decode() is never called on smembers result."""
+        client = MagicMock()
+        client.smembers.return_value = {"valid_tx_id"}
+
+        result = get_discarded_txns(client, self.pubkey)
+
+        # str "valid_tx_id" has no .decode() method — if code called .decode()
+        # it would have raised AttributeError before reaching this assertion.
+        self.assertEqual(result, ["valid_tx_id"])
 
 
 if __name__ == "__main__":

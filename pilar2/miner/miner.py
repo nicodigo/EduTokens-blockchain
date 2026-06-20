@@ -46,18 +46,22 @@ _OUTPUT_RE = re.compile(
 _NOT_FOUND_RE = re.compile(r"No solution found", re.IGNORECASE)
 
 
-def _parse_miner_stdout(stdout: str) -> MinerResult | None:
+def _parse_miner_stdout(stdout: str, stderr: str = "") -> MinerResult | None:
     """Extract nonce + hash from the CUDA miner's stdout.
 
     Returns ``None`` if the miner explicitly reports *no solution found*,
     raises :class:`MinerError` if the output is unparseable.
+
+    *stderr* is included in the error message when stdout is empty,
+    so CUDA init failures (which only write to stderr) are diagnosable.
     """
     if _NOT_FOUND_RE.search(stdout):
         return None
 
     m = _OUTPUT_RE.search(stdout)
     if not m:
-        raise MinerError(f"Could not parse miner output:\n{stdout}")
+        detail = stderr.strip() if stderr.strip() and not stdout.strip() else stdout
+        raise MinerError(f"Could not parse miner output:\n{detail}")
     return MinerResult(nonce=int(m.group("nonce")), hash=m.group("hash"))
 
 
@@ -147,7 +151,11 @@ class MinerService:
                 f"Miner exited with code {proc.returncode}:\n{proc.stderr}"
             )
 
-        return _parse_miner_stdout(proc.stdout)
+        # Surface CUDA errors that produced stderr but exited with code 0/1
+        if proc.stderr and proc.returncode != 0:
+            logger.error("Miner stderr (retcode=%d):\n%s", proc.returncode, proc.stderr)
+
+        return _parse_miner_stdout(proc.stdout, proc.stderr)
 
     # ------------------------------------------------------------------
     # Cancellable mining (audit C1 + L2)
@@ -281,8 +289,11 @@ class MinerService:
                 f"(range [{range_min}, {range_max}])"
             ) from exc
 
-        # L1: log stderr at DEBUG for diagnostics
-        if stderr:
+        # Surface CUDA errors that wrote to stderr
+        if stderr and retcode != 0:
+            logger.error("Miner stderr (PID %d, retcode=%d):\n%s",
+                         proc.pid, retcode, stderr)
+        elif stderr:
             logger.debug("Miner stderr (PID %d):\n%s", proc.pid, stderr)
 
         if retcode not in (0, 1):
@@ -290,4 +301,4 @@ class MinerService:
                 f"Miner exited with code {retcode}:\n{stderr}"
             )
 
-        return _parse_miner_stdout(stdout)
+        return _parse_miner_stdout(stdout, stderr)

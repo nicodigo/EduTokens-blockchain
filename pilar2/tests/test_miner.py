@@ -50,6 +50,19 @@ No solution found in range [0, 999999]
         with self.assertRaises(MinerError):
             _parse_miner_stdout("Some garbage output")
 
+    def test_empty_stdout_with_stderr_surfaces_cuda_error(self):
+        """When stdout is empty but stderr has CUDA init errors,
+        MinerError message must include stderr content."""
+        with self.assertRaises(MinerError) as ctx:
+            _parse_miner_stdout("", stderr="CUDA error: no device found\n")
+        self.assertIn("no device found", str(ctx.exception))
+
+    def test_empty_stdout_without_stderr_is_graceful(self):
+        """Empty stdout with empty stderr still raises MinerError."""
+        with self.assertRaises(MinerError) as ctx:
+            _parse_miner_stdout("", stderr="")
+        self.assertIn("Could not parse", str(ctx.exception))
+
 
 # ---------------------------------------------------------------------------
 # MinerService (subprocess mocked)
@@ -123,6 +136,25 @@ class TestMinerService(unittest.TestCase):
         mock_run.side_effect = OSError("some OS error")
         with self.assertRaises(MinerError):
             self.service.mine("test", "0000")
+
+    @patch("subprocess.run")
+    def test_mine_cuda_init_error_logs_stderr_and_raises(self, mock_run: MagicMock) -> None:
+        """When CUDA init fails (retcode=1, stdout empty, stderr has error),
+        stderr must be logged at ERROR and surfaced in MinerError."""
+        mock_run.return_value = _fake_completed(
+            stdout="",
+            retcode=1,
+        )
+        mock_run.return_value.stderr = "CUDA error: no CUDA-capable device is detected\n"
+        from miner.miner import logger as miner_logger
+        with self.assertLogs(miner_logger, level="ERROR") as log_ctx:
+            with self.assertRaises(MinerError) as exc_ctx:
+                self.service.mine("test", "0000")
+        self.assertIn("no CUDA-capable device", str(exc_ctx.exception))
+        self.assertTrue(
+            any("no CUDA-capable device" in msg for msg in log_ctx.output),
+            "stderr must be logged at ERROR level",
+        )
 
 
 if __name__ == "__main__":

@@ -201,9 +201,18 @@ def cmd_earn(
     authority_pubkey = sk.public_key().public_bytes_raw().hex()
     print(f"Authority pubkey: {authority_pubkey}")
 
+    # Get current nonce for the authority
+    try:
+        account = _get(f"/account/{authority_pubkey}")
+    except SystemExit:
+        print("Could not reach NCT. Is docker compose up?")
+        sys.exit(1)
+    nonce = account.get("nonce", 0)
+    print(f"Current nonce for authority: {nonce}")
+
     body = sign_transaction(
         privkey_hex, authority_pubkey, student_pubkey, amount,
-        "EARN", concept,
+        "EARN", concept, nonce=nonce,
     )
     print(f"Sending EARN {amount} → {student_pubkey[:16]}... ({concept})")
     result = _post("/transaction", body)

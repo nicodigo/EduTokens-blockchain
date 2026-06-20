@@ -79,9 +79,9 @@ class TestWorkerOnTaskErrorHandling(unittest.TestCase):
         self.mock_miner = MagicMock()
         self.worker.miner = self.mock_miner
 
-    def test_on_task_miner_error_nacks_and_requeues(self):
-        """H1: When MinerError propagates from mine_cancellable(), _on_task
-        must nack with requeue=True so the task is not lost."""
+    def test_on_task_miner_error_dead_letters(self):
+        """MinerError (binary crash) must dead-letter the message (requeue=False),
+        not requeue infinitely.  _do_task catches MinerError internally."""
         self.mock_miner.mine_cancellable.side_effect = MinerError(
             "simulated miner crash",
         )
@@ -95,14 +95,13 @@ class TestWorkerOnTaskErrorHandling(unittest.TestCase):
             b'"difficulty":4,"range_min":0,"range_max":999}'
         )
 
-        # This must NOT raise
+        # This must NOT raise — MinerError caught inside _do_task
         self.worker._on_task(mock_ch, mock_method, None, task_body)
 
-        # Must have called nack with requeue=True
+        # Must dead-letter (requeue=False) — binary crash is not transient
         mock_ch.basic_nack.assert_called_once_with(
-            delivery_tag=42, requeue=True
+            delivery_tag=42, requeue=False
         )
-        # Must NOT have called ack (failure path)
         mock_ch.basic_ack.assert_not_called()
 
     def test_on_task_unexpected_error_nacks_and_requeues(self):
@@ -233,6 +232,28 @@ class TestWorkerCancellableMining(unittest.TestCase):
         call_kwargs = self.mock_miner.mine_cancellable.call_args[1]
         self.assertIn("abort_event", call_kwargs)
         self.assertIs(call_kwargs["abort_event"], self.worker._aborted)
+
+    def test_miner_error_dead_letters_in_do_task(self):
+        """When mine_cancellable raises MinerError, _do_task must nack
+        with requeue=False (dead-letter) and NOT propagate the exception."""
+        self.mock_miner.mine_cancellable.side_effect = MinerError(
+            "CUDA error: no CUDA-capable device is detected",
+        )
+
+        mock_ch = MagicMock()
+        mock_method = MagicMock()
+        mock_method.delivery_tag = 77
+
+        # Must NOT raise — MinerError caught inside _do_task
+        self.worker._on_task(mock_ch, mock_method, None, self._task_body())
+
+        # Must dead-letter (requeue=False) to avoid infinite loop
+        mock_ch.basic_nack.assert_called_once_with(
+            delivery_tag=77, requeue=False,
+        )
+        mock_ch.basic_ack.assert_not_called()
+        # Must NOT have published any result
+        self.worker._channel.basic_publish.assert_not_called()
 
 
 if __name__ == "__main__":

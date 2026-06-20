@@ -656,7 +656,7 @@ def _consume_with_reconnect(pool: Any) -> None:
                 pool._channel.basic_consume(
                     queue=f"pool.{pool.pool_id}.results",
                     on_message_callback=pool._on_worker_result,
-                    auto_ack=True,
+                    auto_ack=False,
                 )
                 pool._channel.basic_consume(
                     queue=f"pool.{pool.pool_id}.registry",

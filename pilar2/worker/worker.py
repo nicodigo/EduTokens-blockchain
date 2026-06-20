@@ -30,7 +30,7 @@ from broker.broker import (
     reconnect_rabbitmq,
 )
 from broker.messages import ControlMessage, RegistrationMessage, ResultMessage, TaskMessage
-from miner.miner import MinerService
+from miner.miner import MinerError, MinerService
 from shared.env import env_int, env_float
 from shared.schemas import (
     HealthResponse,
@@ -367,16 +367,27 @@ class WorkerService:
         # can interrupt a running mining task.  The process_events callback
         # lets pika drain its I/O buffer and dispatch _on_control between
         # polls — without this, the abort mechanism is completely ineffective.
-        result = self.miner.mine_cancellable(
-            base_string=task.fingerprint,
-            target_prefix=target_prefix,
-            range_min=task.range_min,
-            range_max=task.range_max,
-            abort_event=self._aborted,
-            process_events=lambda: self._connection.process_data_events(
-                time_limit=0.1,
-            ),
-        )
+        try:
+            result = self.miner.mine_cancellable(
+                base_string=task.fingerprint,
+                target_prefix=target_prefix,
+                range_min=task.range_min,
+                range_max=task.range_max,
+                abort_event=self._aborted,
+                process_events=lambda: self._connection.process_data_events(
+                    time_limit=0.1,
+                ),
+            )
+        except MinerError as exc:
+            logger.error(
+                "Worker %s: miner fatal error for task %s — discarding (no requeue): %s",
+                self.worker_id, task.task_id, exc,
+            )
+            try:
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            except Exception:
+                pass
+            return
 
         if self._aborted.is_set():
             logger.info("Task %s aborted — discarding result", task.task_id)

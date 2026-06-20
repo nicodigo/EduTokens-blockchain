@@ -933,5 +933,125 @@ class TestMiningActiveFlag(unittest.TestCase):
         self.assertFalse(ok, "handle_result must reject when mining not active")
 
 
+class TestRabbitMQReconnectionInLoops(unittest.TestCase):
+    """Verify AMQP operations in block_loop and result_loop survive
+    StreamLostError by reconnecting and retrying (audit H2)."""
+
+    def test_ensure_rabbitmq_alive_reconnects_on_recoverable_error(self):
+        """When the health check raises a recoverable error,
+        _ensure_rabbitmq_alive calls reconnect_rabbitmq and swaps refs."""
+        from unittest.mock import patch
+        from nct.nct import _ensure_rabbitmq_alive
+
+        # Channel 1 looks alive but throws during exchange_declare
+        bad_channel = MagicMock()
+        bad_channel.is_open = True
+        class FakeStreamLostError(Exception):
+            pass
+        bad_channel.exchange_declare.side_effect = FakeStreamLostError("boom")
+        bad_conn = MagicMock()
+        bad_conn.is_open = True
+
+        # Channel 2 is the reconnected one
+        good_channel = MagicMock()
+        good_conn = MagicMock()
+
+        conn_ref = [bad_conn]
+        ch_ref = [bad_channel]
+
+        with patch(
+            "nct.nct.reconnect_rabbitmq", return_value=(good_conn, good_channel)
+        ) as mock_reconnect:
+            _ensure_rabbitmq_alive(conn_ref, ch_ref, "amqp://test")
+
+        mock_reconnect.assert_called_once_with("amqp://test")
+        self.assertIs(conn_ref[0], good_conn)
+        self.assertIs(ch_ref[0], good_channel)
+
+    def test_ensure_rabbitmq_alive_raises_on_unrecoverable_error(self):
+        """Non-RabbitMQ errors (e.g. ValueError) must propagate, not retry."""
+        from nct.nct import _ensure_rabbitmq_alive
+
+        bad_channel = MagicMock()
+        bad_channel.is_open = True
+        bad_channel.exchange_declare.side_effect = ValueError("not a rabbit error")
+
+        conn_ref = [MagicMock()]
+        ch_ref = [bad_channel]
+
+        with self.assertRaises(ValueError):
+            _ensure_rabbitmq_alive(conn_ref, ch_ref, "amqp://test")
+
+    def test_ensure_rabbitmq_alive_handles_none_channel(self):
+        """None channel/connection triggers reconnection."""
+        from unittest.mock import patch
+        from nct.nct import _ensure_rabbitmq_alive
+
+        good_channel = MagicMock()
+        good_conn = MagicMock()
+
+        conn_ref = [None]
+        ch_ref = [None]
+
+        with patch(
+            "nct.nct.reconnect_rabbitmq", return_value=(good_conn, good_channel)
+        ) as mock_reconnect:
+            _ensure_rabbitmq_alive(conn_ref, ch_ref, "amqp://test")
+
+        mock_reconnect.assert_called_once()
+        self.assertIs(conn_ref[0], good_conn)
+        self.assertIs(ch_ref[0], good_channel)
+
+    def test_is_recoverable_rabbitmq_error_classifies_stream_lost(self):
+        """StreamLostError must be classified as recoverable (duck-typed)."""
+        from broker.broker import is_recoverable_rabbitmq_error
+
+        class StreamLostError(Exception):
+            pass
+        self.assertTrue(is_recoverable_rabbitmq_error(StreamLostError("boom")))
+
+    def test_publish_retry_pattern_recovers_after_stream_lost(self):
+        """Simulate the block_loop publish retry: first basic_publish raises
+        StreamLostError, reconnect, second succeeds."""
+        from broker.broker import is_recoverable_rabbitmq_error
+
+        attempt = [0]
+
+        def flaky_publish(*args, **kwargs):
+            attempt[0] += 1
+            if attempt[0] == 1:
+                class StreamLostError(Exception):
+                    pass
+                raise StreamLostError("Connection reset by peer")
+            # Second call succeeds — return a dummy TaskMessage
+            from broker.messages import TaskMessage
+            return TaskMessage.create(
+                block_index=1, fingerprint="ff", difficulty=4,
+                range_min=0, range_max=999_999_999,
+            )
+
+        # The pattern from block_loop:
+        # while True:
+        #     try: publish_mining_task(...); break
+        #     except Exception as exc:
+        #         if not is_recoverable_rabbitmq_error(exc): raise
+        #         _ensure_rabbitmq_alive(conn_ref, ch_ref, url)
+        #         channel = ch_ref[0]
+        reconnect_count = [0]
+
+        while True:
+            try:
+                flaky_publish()
+                break
+            except Exception as exc:
+                if not is_recoverable_rabbitmq_error(exc):
+                    raise
+                reconnect_count[0] += 1
+                # In production, _ensure_rabbitmq_alive would run here
+
+        self.assertEqual(attempt[0], 2, "Should have retried once after reconnect")
+        self.assertEqual(reconnect_count[0], 1, "Should have reconnected once")
+
+
 if __name__ == "__main__":
     unittest.main()

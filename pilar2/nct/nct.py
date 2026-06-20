@@ -379,13 +379,25 @@ def block_loop(
 
             state.set_current_block(block, nonce_space)
 
-            publish_mining_task(
-                channel,
-                block_index=block.index,
-                fingerprint=block.fingerprint,
-                difficulty=config.difficulty,
-                range_size=nonce_space,
-            )
+            # Publish with reconnect on transient RabbitMQ errors (audit H2)
+            while True:
+                try:
+                    publish_mining_task(
+                        channel,
+                        block_index=block.index,
+                        fingerprint=block.fingerprint,
+                        difficulty=config.difficulty,
+                        range_size=nonce_space,
+                    )
+                    break
+                except Exception as exc:
+                    if not is_recoverable_rabbitmq_error(exc):
+                        raise
+                    logger.warning(
+                        "RabbitMQ error publishing mining task — reconnecting: %s", exc
+                    )
+                    _ensure_rabbitmq_alive(conn_ref, ch_ref, config.rabbitmq_url)
+                    channel = ch_ref[0]
 
             logger.info("Waiting for PoW solution for block %d (nonce_space=%d)...",
                          block.index, nonce_space)
@@ -430,9 +442,19 @@ def result_loop(
         had_work = False
 
         # ---- Poll mining results (audit H1: manual ack for crash safety) ----
-        method, _properties, body = channel.basic_get(
-            queue=RESULTS_QUEUE, auto_ack=False,
-        )
+        try:
+            method, _properties, body = channel.basic_get(
+                queue=RESULTS_QUEUE, auto_ack=False,
+            )
+        except Exception as exc:
+            if not is_recoverable_rabbitmq_error(exc):
+                raise
+            logger.warning(
+                "RabbitMQ error polling mining results — reconnecting: %s", exc
+            )
+            _ensure_rabbitmq_alive(conn_ref, ch_ref, rmq_url)
+            channel = ch_ref[0]
+            continue
         if method and body:
             try:
                 result = ResultMessage.from_json(body.decode())
@@ -457,9 +479,19 @@ def result_loop(
             had_work = True
 
         # ---- Poll worker registry (heartbeats + pool liveness) ----
-        method, _properties, body = channel.basic_get(
-            queue=WORKER_REGISTRY_QUEUE, auto_ack=False,
-        )
+        try:
+            method, _properties, body = channel.basic_get(
+                queue=WORKER_REGISTRY_QUEUE, auto_ack=False,
+            )
+        except Exception as exc:
+            if not is_recoverable_rabbitmq_error(exc):
+                raise
+            logger.warning(
+                "RabbitMQ error polling worker registry — reconnecting: %s", exc
+            )
+            _ensure_rabbitmq_alive(conn_ref, ch_ref, rmq_url)
+            channel = ch_ref[0]
+            continue
         if method and body:
             try:
                 data = json.loads(body.decode())
