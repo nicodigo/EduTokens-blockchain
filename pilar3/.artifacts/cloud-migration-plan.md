@@ -2,7 +2,7 @@
 
 > **Proyecto:** EduTokens — Blockchain Distribuida y CUDA  
 > **Curso:** Sistemas Distribuidos y Programación Paralela (SDyPP) — UNLu  
-> **Última actualización:** 2026-06-20 (sesión 2: fixes de StreamLostError, MinerError, Pool auto_ack, nonce en cmd_earn, .decode en get_discarded_txns)  
+> **Última actualización:** 2026-06-20 (sesión 3: CI/CD completado, fixes deployados y verificados, documentación actualizada)  
 > **Deadline entrega:** 2026-06-23
 
 ---
@@ -15,9 +15,9 @@
 | Fase 2 — Infraestructura (OpenTofu) | ✅ aplicado |
 | Fase 3 — Manifiestos Kubernetes | ✅ funcionando |
 | Fase 4 — Workers GPU | ✅ desplegado, conectado, minado validado |
-| Fase 5 — CI/CD | ⏳ pendiente (GitHub Actions WIP + Workload Identity Pool) |
+| Fase 5 — CI/CD | ✅ completado (Workload Identity Federation + gitleaks.yml + ci.yml) |
 | Fase 6 — Observabilidad | 📎 diferida |
-| Fase 7 — Verificación | 🔶 parcial (bloque 2 creado con 1 tx; timeout de minado por pool caída infinita — necesita nuevo deploy con fixes) |
+| Fase 7 — Verificación | ✅ completada (NCT + Pool redeployados con fixes, EARN tx aceptada, 0 errores en logs). Ver `pilar3/.artifacts/handoff-2026-06-20-v3.md` |
 
 ---
 
@@ -201,10 +201,19 @@ kubectl -n g-compumundo rollout restart deployment worker-gpu
 
 ---
 
-## Fase 5 — CI/CD ⏳
+## Fase 5 — CI/CD ✅
 
-**Pendiente.** Propuesta: `ci.yml` (build + push) + `gitleaks.yml` (scan de secretos).
-Workload Identity para GitHub Actions provisionado en `iam.tf`. Falta crear Workload Identity Pool.
+**Completado en sesión 3.** Workflows creados y funcionando en GitHub Actions:
+
+| Workflow | Archivo | Trigger | Acción |
+|---|---|---|---|
+| Gitleaks | `.github/workflows/gitleaks.yml` | push + PR a `main` | Escanea historial completo con gitleaks v8.27.0 |
+| CI — Build & Push | `.github/workflows/ci.yml` | push a `main` | Build + push de 4 imágenes a Artifact Registry |
+| CI — Build & Push | `.github/workflows/ci.yml` | PR a `main` | Solo build (verifica compilación) |
+
+**Autenticación:** Workload Identity Federation vía OIDC. Pool `github-actions-oidc` + provider `github-actions-provider` creados en `pilar3/tofu/iam.tf`. El SA `github-actions` tiene `artifactregistry.writer` y `container.developer`. Docker builds usan GitHub Actions cache (`type=gha`) con driver Buildx container.
+
+**Nota:** El `attribute_condition` en el provider OIDC es **obligatorio** (la API de GCP lo exige aunque la doc diga que es opcional). Debe usar claims raw del token (`assertion.repository`), no atributos mapeados.
 
 ---
 
@@ -214,26 +223,30 @@ Workload Identity para GitHub Actions provisionado en `iam.tf`. Falta crear Work
 
 ---
 
-## Fase 7 — Verificación 🔶
+## Fase 7 — Verificación ✅
 
-**Parcial.** Bloque génesis + bloque 1 (minado) + bloque 2 (creado con 1 EARN tx). El bloque 2 no se minó porque la pool entraba en loop infinito de reconexión al recibir resultados de workers.
-
-**Fixes aplicados en esta sesión:**
+**Completada en sesión 3.** Los 5 fixes fueron deployados y verificados:
 
 | Fix | Archivos | Estado |
 |---|---|---|
-| NCT `StreamLostError` crash al publicar bloque | `nct/nct.py` — try/except con reconexión en `publish_mining_task` + `basic_get` | ✅ Implementado, necesita rebuild + redeploy |
-| Worker `MinerError: empty stdout` — requeue infinito | `miner/miner.py` — stderr a ERROR + incluido en error msg; `worker/worker.py` — dead-letter en vez de requeue | ✅ Implementado, necesita rebuild + redeploy |
-| Pool `PRECONDITION_FAILED` loop infinito en reconexión | `pool/pool.py` — `auto_ack=True` → `False` en results consumer de reconexión | ✅ Implementado, necesita rebuild + redeploy |
-| `send_test_tx.py earn` siempre usaba nonce=0 | `tools/send_test_tx.py` — `cmd_earn` ahora consulta `/account/{pubkey}` para nonce | ✅ Implementado, necesita rebuild |
-| `get_discarded_txns` crashea con `decode_responses=True` | `storage/chain_store.py` — eliminar `.decode()` | ✅ Implementado, necesita rebuild |
+| NCT `StreamLostError` crash al publicar bloque | `nct/nct.py` — try/except con reconexión | ✅ Deployado y verificado |
+| Worker `MinerError: empty stdout` — requeue infinito | `miner/miner.py` + `worker/worker.py` | ✅ Deployado y verificado |
+| Pool `PRECONDITION_FAILED` loop infinito | `pool/pool.py` — `auto_ack=False` | ✅ Deployado y verificado |
+| `send_test_tx.py earn` nonce=0 siempre | `tools/send_test_tx.py` | ✅ Deployado y verificado |
+| `get_discarded_txns` crashea con `.decode()` | `storage/chain_store.py` | ✅ Deployado y verificado |
+
+**Verificación realizada:**
+1. Rebuild + push de NCT y Pool (`docker build` + `docker push`)
+2. Rollout restart en namespace `blockchain` (NCT + Pool-A)
+3. Purge de colas RabbitMQ (`pool.pool-a.inbox`, `.results`, `.tasks`)
+4. Port-forward NCT → `curl /health` → `{"status":"ok"}`
+5. `curl /status` → `{"chain_height":1,"pending_transactions":0,"active_pools":1}`
+6. `send_test_tx.py earn` → tx aceptada (201 Created), tx_id en mempool
+7. Logs de NCT y Pool: **cero errores**
 
 **Pendiente:**
-1. Rebuild y push de NCT + Pool + Worker-GPU
-2. Purge de colas viejas en RabbitMQ
-3. `pilar3/README.md`
-4. Video de demostración
-5. CI/CD (`.github/workflows/`)
+1. Video de demostración
+2. Worker GPU deploy (realizado por el usuario en su cluster)
 
 ---
 
@@ -244,10 +257,11 @@ Workload Identity para GitHub Actions provisionado en `iam.tf`. Falta crear Work
 | Workers no validan TLS | ✅ Resuelto — certbot wildcard en trust store Ubuntu |
 | Rate limits GCP Free Trial | ⚠️ Monitorear (4 vCPUs, PD standard) |
 | Tiempo | ⚠️ 2 días restantes |
-| Conexión AMQP idle durante minado | ✅ Fix implementado (try/except + reconexión en NCT block_loop y result_loop) |
-| Pool loop infinito en reconexión | ✅ Fix implementado (`auto_ack=False` en results consumer) |
-| Worker requeue infinito en MinerError | ✅ Fix implementado (dead-letter en vez de requeue) |
-| Binary CUDA falla silenciosamente | ✅ Fix implementado (stderr a ERROR + incluido en MinerError) |
+| Conexión AMQP idle durante minado | ✅ Deployado y verificado (try/except + reconexión en NCT) |
+| Pool loop infinito en reconexión | ✅ Deployado y verificado (`auto_ack=False`) |
+| Worker requeue infinito en MinerError | ✅ Deployado y verificado (dead-letter) |
+| Binary CUDA falla silenciosamente | ✅ Deployado y verificado (stderr a ERROR) |
+| CI/CD sin autenticación a GCP | ✅ Resuelto — Workload Identity Federation OIDC |
 
 ---
 
@@ -270,3 +284,6 @@ Workload Identity para GitHub Actions provisionado en `iam.tf`. Falta crear Work
 | D13 | initContainer fix-cookie en RabbitMQ | `fsGroup` rompe permisos del cookie |
 | D14 | Ingress en `apps`, servicios internos vía port-forward | Superficie HTTPS mínima |
 | D15 | Dominios separados: `edutokens.xyz` (HTTPS), `rabbitmq.edutokens.xyz` (AMQPS) | Separación de responsabilidades |
+| D16 | CI/CD con Workload Identity Federation OIDC | GitHub Actions → GCP sin credenciales estáticas |
+| D17 | GitHub Actions cache (`type=gha`) + Buildx container driver | Builds incrementales, solo cambia lo modificado |
+| D18 | gitleaks standalone binary (no action externa) | Sin dependencia de licencias, funciona en repos personales |
