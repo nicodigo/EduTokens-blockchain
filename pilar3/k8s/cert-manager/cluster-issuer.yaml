@@ -7,8 +7,8 @@ metadata:
   name: letsencrypt-prod
 spec:
   acme:
-    # Staging: certificados falsos pero sin rate limits. Cambiar a production al validar.
-    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    # Let's Encrypt production — certificados reales
+    server: https://acme-v02.api.letsencrypt.org/directory
     email: "mi-mail@mail.com"
     privateKeySecretRef:
       name: letsencrypt-prod-account-key

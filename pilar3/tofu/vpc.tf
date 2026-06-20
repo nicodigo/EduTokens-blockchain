@@ -70,7 +70,16 @@ resource "google_compute_address" "rabbitmq" {
   name         = "rabbitmq-static-ip"
   region       = var.region
   address_type = "EXTERNAL"
-  network_tier = "STANDARD"  # free tier: STANDARD tier es más barato
+  # PREMIUM tier: requerido por GKE LoadBalancer
+  depends_on = [google_project_service.services]
+}
 
-  depends_on = [google_project_service.services]  # garantiza compute.googleapis.com activa
+# --- IP estática regional para nginx-ingress LoadBalancer ---
+resource "google_compute_address" "nginx_ingress" {
+  name         = "nginx-ingress-static-ip"
+  region       = var.region
+  address_type = "EXTERNAL"
+  # PREMIUM tier por defecto
+
+  depends_on = [google_project_service.services]
 }

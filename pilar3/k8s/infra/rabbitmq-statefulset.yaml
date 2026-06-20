@@ -20,6 +20,15 @@ spec:
       terminationGracePeriodSeconds: 30
       securityContext:
         fsGroup: 100    # rabbitmq UID en Alpine
+      # Init container: borra el cookie viejo (corrupto por fsGroup)
+      # RabbitMQ lo regenera correctamente gracias a RABBITMQ_ERLANG_COOKIE
+      initContainers:
+      - name: fix-cookie
+        image: busybox:1.36
+        command: ['sh', '-c', 'rm -f /var/lib/rabbitmq/.erlang.cookie']
+        volumeMounts:
+        - name: rabbitmq-data
+          mountPath: /var/lib/rabbitmq
       containers:
       - name: rabbitmq
         image: rabbitmq:3-management-alpine
@@ -35,6 +44,11 @@ spec:
             secretKeyRef:
               name: rabbitmq-credentials
               key: password
+        - name: RABBITMQ_ERLANG_COOKIE
+          valueFrom:
+            secretKeyRef:
+              name: rabbitmq-credentials
+              key: erlang-cookie
         ports:
         - name: amqp
           containerPort: 5672
@@ -87,7 +101,7 @@ spec:
           defaultMode: 0444
       - name: rabbitmq-tls
         secret:
-          secretName: rabbitmq-tls
+          secretName: rabbitmq-amqps-tls
           defaultMode: 0444
   volumeClaimTemplates:
   - metadata:

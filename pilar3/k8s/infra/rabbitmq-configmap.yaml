@@ -14,15 +14,14 @@ data:
     ## AMQPS (con TLS) — para Workers externos
     listeners.ssl.default = 5671
 
-    ## Certificados TLS generados por cert-manager
-    ssl_options.cacertfile = /etc/rabbitmq/ssl/ca.crt
+    ## Certificados TLS (certbot wildcard — Let's Encrypt)
     ssl_options.certfile   = /etc/rabbitmq/ssl/tls.crt
     ssl_options.keyfile    = /etc/rabbitmq/ssl/tls.key
+    ssl_options.cacertfile = /etc/ssl/certs/ca-certificates.crt
 
-    ## TLS: verifica peer pero no exige certificado de cliente
+    ## Let's Encrypt está en el trust store de Alpine
     ssl_options.verify               = verify_peer
     ssl_options.fail_if_no_peer_cert = false
-    ssl_options.depth                = 2
 
     ## Management UI
     management.tcp.port = 15672

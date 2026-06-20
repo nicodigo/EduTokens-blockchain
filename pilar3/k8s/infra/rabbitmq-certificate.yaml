@@ -1,22 +1,7 @@
-# RabbitMQ Certificate — TLS vía cert-manager + Let's Encrypt
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata:
-  name: rabbitmq-tls
-  namespace: infra
-  labels:
-    app: rabbitmq
-spec:
-  secretName: rabbitmq-tls
-  duration: 2160h       # 90 días
-  renewBefore: 720h     # 30 días
-  issuerRef:
-    name: letsencrypt-prod
-    kind: ClusterIssuer
-  dnsNames:
-  - rabbitmq.edutokens.duckdns.org
-  privateKey:
-    algorithm: RSA
-    size: 2048
-  usages:
-  - server auth
+# ── Intencionalmente eliminado ───────────────────────────────────
+# El certificado AMQPS ahora es autofirmado, generado con:
+#   ./pilar3/scripts/gen-amqps-certs.sh
+# El Secret se crea manualmente:
+#   kubectl -n infra create secret generic rabbitmq-amqps-tls --from-file=...
+# Este archivo queda como referencia de que ya no usamos cert-manager para AMQPS.
+# ───────────────────────────────────────────────────────────────────

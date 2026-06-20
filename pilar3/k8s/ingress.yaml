@@ -1,63 +1,50 @@
 # Ingress — HTTPS con certificado Let's Encrypt vía cert-manager
+# Namespace: apps — único punto de entrada HTTPS desde internet
 #
-# Dominios planificados (agregar al cert-manager Certificate y a este Ingress):
-#   - rabbitmq.edutokens.duckdns.org  → infra/rabbitmq:15672 (management)
-#   - api.edutokens.duckdns.org       → blockchain/nct:8080     (pendiente frontend)
-#   - app.edutokens.duckdns.org       → apps/frontend:80        (compañeros)
+# Dominios:
+#   edutokens.xyz  → /  → apps/frontend:80  (cuando se despliegue el frontend)
+#
+# NCT y RabbitMQ Management NO se exponen vía Ingress.
+# Se acceden con kubectl port-forward:
+#   kubectl -n blockchain port-forward svc/nct 8080:8080
+#   kubectl -n infra port-forward svc/rabbitmq 15672:15672
 #
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: edutokens-ingress
-  namespace: infra
+  namespace: apps
   labels:
     app: edutokens
   annotations:
     cert-manager.io/cluster-issuer: "letsencrypt-prod"
-    # Redirigir HTTP → HTTPS
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
-    # WebSocket support (RabbitMQ Management necesita WebSocket para métricas en tiempo real)
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
 spec:
   ingressClassName: nginx
   tls:
   - hosts:
-    - rabbitmq.edutokens.duckdns.org
-    # Dominios futuros — agregar aquí y en el Certificate:
-    # - api.edutokens.duckdns.org
-    # - app.edutokens.duckdns.org
+    - edutokens.xyz
     secretName: edutokens-tls
   rules:
-  - host: rabbitmq.edutokens.duckdns.org
+  - host: edutokens.xyz
     http:
       paths:
       - path: /
         pathType: Prefix
         backend:
           service:
-            name: rabbitmq
+            name: frontend
             port:
-              number: 15672
+              number: 80
   # --- Dominios futuros (descomentar cuando existan los backends) ---
-  # - host: api.edutokens.duckdns.org
+  # - host: api.edutokens.xyz
   #   http:
   #     paths:
   #     - path: /
   #       pathType: Prefix
   #       backend:
   #         service:
-  #           name: nct
+  #           name: nct-api
   #           port:
   #             number: 8080
-  # - host: app.edutokens.duckdns.org
-  #   http:
-  #     paths:
-  #     - path: /
-  #       pathType: Prefix
-  #       backend:
-  #         service:
-  #           name: frontend
-  #           port:
-  #             number: 80

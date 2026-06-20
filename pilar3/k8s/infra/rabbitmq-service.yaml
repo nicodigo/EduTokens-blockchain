@@ -17,10 +17,8 @@ metadata:
     # con el mismo nombre en google_compute_address.
 spec:
   type: LoadBalancer
-  # Descomentar cuando la IP esté reservada:
-  loadBalancerIP: "35.208.99.193"
-  # Restringir AMQPS (puerto 5671) al cluster GPU del profesor
-  # Cuando se conozcan los CIDRs, reemplazar 0.0.0.0/0
+  # IP estática gestionada por OpenTofu (tofu output rabbitmq_static_ip)
+  loadBalancerIP: "35.255.11.243"
   loadBalancerSourceRanges:
   - "0.0.0.0/0"  # ⚠️ REEMPLAZAR con IPs del cluster GPU
   selector:

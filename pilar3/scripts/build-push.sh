@@ -22,6 +22,12 @@ docker build -f "$PILAR2/pool/Dockerfile"   -t "$REGISTRY/pool:latest" "$PILAR2"
 echo "==> Build Worker CPU..."
 docker build -f "$PILAR2/worker/Dockerfile" -t "$REGISTRY/worker-cpu:latest" "$PILAR2"
 
+echo "==> Build Worker GPU..."
+docker build \
+  -f pilar3/docker/worker-gpu.Dockerfile \
+  -t "$REGISTRY/worker-gpu:latest" \
+  .
+
 echo ""
 echo "==> Push NCT..."
 docker push "$REGISTRY/nct:latest"
@@ -32,8 +38,12 @@ docker push "$REGISTRY/pool:latest"
 echo "==> Push Worker CPU..."
 docker push "$REGISTRY/worker-cpu:latest"
 
+echo "==> Push Worker GPU..."
+docker push "$REGISTRY/worker-gpu:latest"
+
 echo ""
 echo "✅ Build y push completado"
 echo "   $REGISTRY/nct:latest"
 echo "   $REGISTRY/pool:latest"
 echo "   $REGISTRY/worker-cpu:latest"
+echo "   $REGISTRY/worker-gpu:latest"

@@ -30,6 +30,16 @@ output "rabbitmq_static_ip_name" {
   value       = google_compute_address.rabbitmq.name
 }
 
+output "nginx_ingress_static_ip" {
+  description = "IP pública estática para nginx-ingress LoadBalancer"
+  value       = google_compute_address.nginx_ingress.address
+}
+
+output "nginx_ingress_static_ip_name" {
+  description = "Nombre del recurso de IP estática del nginx-ingress"
+  value       = google_compute_address.nginx_ingress.name
+}
+
 output "artifact_registry_url" {
   description = "URL del repositorio Docker en Artifact Registry"
   value       = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.docker.repository_id}"

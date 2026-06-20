@@ -10,6 +10,7 @@ K8S_DIR="$(cd "$(dirname "$0")/../k8s" && pwd)"
 echo "==> 1/5 Namespaces"
 kubectl apply -f "$K8S_DIR/infra/namespace.yaml"
 kubectl apply -f "$K8S_DIR/blockchain/namespace.yaml"
+kubectl apply -f "$K8S_DIR/apps/namespace.yaml"
 
 echo "==> 2/5 ConfigMaps + Secrets + ServiceAccount + ClusterIssuer"
 kubectl apply -f "$K8S_DIR/blockchain/configmap.yaml"
@@ -31,8 +32,8 @@ kubectl apply -f "$K8S_DIR/infra/rabbitmq-statefulset.yaml"
 kubectl apply -f "$K8S_DIR/blockchain/nct-deployment.yaml"
 kubectl apply -f "$K8S_DIR/blockchain/pool-deployment.yaml"
 
-echo "==> 5/5 Certificate + Ingress"
-kubectl apply -f "$K8S_DIR/infra/rabbitmq-certificate.yaml"
+echo "==> 5/5 Ingress"
+# El Ingress está en apps (único namespace con tráfico HTTPS)
 kubectl apply -f "$K8S_DIR/ingress.yaml"
 
 echo ""
@@ -47,7 +48,7 @@ echo ""
 echo "==> Estado final"
 kubectl get pods -n infra
 kubectl get pods -n blockchain
-kubectl get certificate -n infra
+kubectl get certificate -n apps
 
 echo ""
 echo "✅ Deploy completado"
