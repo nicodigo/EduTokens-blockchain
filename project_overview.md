@@ -14,7 +14,7 @@ An end-to-end prototype of a **distributed, Proof-of-Work blockchain** built fro
 |---|---|---|
 | **Pilar 1** | CUDA GPU miner (MD5 PoW) | ✅ Complete |
 | **Pilar 2** | Distributed Python microservices + Docker | ✅ Complete |
-| **Pilar 3** | Kubernetes (GKE) + CI/CD + Cloud deployment | 🔲 Pending |
+| **Pilar 3** | Kubernetes (GKE) + CI/CD + Cloud deployment | ✅ Complete |
 
 ---
 
@@ -402,18 +402,104 @@ cd pilar2 && python -m unittest discover tests/ -v
 
 ---
 
-## Pilar 3 — Pending (Cloud Deployment)
+## Pilar 3 — Cloud Deployment (GKE + CI/CD)
 
-According to the assignment, Pilar 3 requires:
+Full deployment guide: **[pilar3/README.md](pilar3/README.md)**
 
-- **GKE cluster** via OpenTofu (IaC), with separate node groups for infra vs apps
-- **4 CI/CD pipelines** (GitHub Actions): cluster setup, infra services, app deploy, VM workers
-- **Kubernetes HPA** or Cloud Run for auto-scaling CPU miners when GPU workers are unavailable
-- **gitleaks** in CI to block hardcoded secrets
-- **Public endpoints** for each service
-- **Load testing** with 1–100K transactions and prefix lengths 1–8 chars
+### Architecture
 
-No code has been written for Pilar 3 yet.
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  GKE Cluster — us-central1-a (zonal, free tier, 2 × e2-standard-2)   │
+│                                                                       │
+│  ┌── namespace: infra ───────────────────────────────────────────┐   │
+│  │  Redis (StatefulSet ×1)     RabbitMQ (StatefulSet ×1)          │   │
+│  │  PVC 10Gi, AOF              AMQP :5672 / AMQPS :5671 (TLS)     │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                       │
+│  ┌── namespace: blockchain ───────────────────────────────────────┐   │
+│  │  NCT (Deployment ×1)        Pool-A (Deployment ×1)              │   │
+│  │  ClusterIP :8080            ClusterIP :8090                     │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                       │
+│  ┌── namespace: apps ────────────────────────────────────────────┐   │
+│  │  nginx-ingress + cert-manager (Let's Encrypt production)        │   │
+│  │  Dominio: edutokens.xyz                                         │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                       │
+│  ┌── cluster externo (profesor): namespace g-compumundo ─────────┐   │
+│  │  Worker GPU (RTX 4060, sm_89, CUDA 12.2)                       │   │
+│  │  → AMQPS a rabbitmq.edutokens.xyz:5671                         │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Infrastructure as Code (OpenTofu)
+
+10 archivos `.tf` en `pilar3/tofu/`. Administran:
+- GKE cluster zonal + node pool (2 × e2-standard-2)
+- VPC, subred, Cloud NAT
+- Artifact Registry (`edutokens-repo`)
+- 2 IPs estáticas PREMIUM (RabbitMQ LoadBalancer, nginx-ingress)
+- Workload Identity: GKE pods (SA `gke-pull-images`) y GitHub Actions OIDC (SA `github-actions`)
+- IAM bindings para ambos service accounts
+
+### Kubernetes Manifests
+
+16 archivos YAML en 4 namespaces (`infra`, `blockchain`, `apps`, `workers`):
+- **Redis** StatefulSet con PVC 10Gi (AOF persistence)
+- **RabbitMQ** StatefulSet con TLS (AMQPS para workers externos) + LoadBalancer
+- **NCT** Deployment singleton (coordinador), ClusterIP :8080
+- **Pool-A** Deployment, ClusterIP :8090
+- **nginx-ingress** + **cert-manager** con Let's Encrypt production (wildcard `*.edutokens.xyz`)
+- **Worker GPU** deployment para cluster del profesor (`nvidia.com/gpu: 1`)
+
+### Docker Images
+
+| Imagen | Dockerfile | Registro |
+|---|---|---|
+| `nct:latest` | `pilar2/nct/Dockerfile` | `us-central1-docker.pkg.dev/edutokens-2026/edutokens-repo` |
+| `pool:latest` | `pilar2/pool/Dockerfile` | ↑ |
+| `worker-cpu:latest` | `pilar2/worker/Dockerfile` | ↑ |
+| `worker-gpu:latest` | `pilar3/docker/worker-gpu.Dockerfile` | ↑ |
+
+El worker GPU usa `nvidia/cuda:12.2.2-runtime-ubuntu22.04`, compilado para RTX 4060 (sm_89).
+
+### CI/CD (GitHub Actions)
+
+| Workflow | Trigger | Acción |
+|---|---|---|
+| `gitleaks.yml` | push + PR a `main` | Escanea historial completo en busca de secretos |
+| `ci.yml` | push a `main` | Build + push de las 4 imágenes a Artifact Registry |
+| `ci.yml` | PR a `main` | Solo build (verifica compilación, sin pushear) |
+
+La autenticación a GCP usa **Workload Identity Federation** vía OIDC (`token.actions.githubusercontent.com`). Cero service account keys — GitHub emite un token OIDC por workflow run, GCP lo valida contra el pool `github-actions-oidc` y lo mapea a la SA `github-actions`. Docker builds usan GitHub Actions cache para builds incrementales (solo se reconstruyen las capas modificadas).
+
+### Bugs corregidos en producción
+
+Durante el despliegue se identificaron y corrigieron 5 bugs críticos (detallados en `pilar3/.artifacts/handoff-2026-06-20-v2.md`):
+
+| Bug | Fix | Archivo |
+|---|---|---|
+| NCT `StreamLostError` (RabbitMQ idle timeout) | try/except + `_ensure_rabbitmq_alive()` con reconexión | `pilar2/nct/nct.py` |
+| Worker `MinerError: empty stdout` → requeue infinito | stderr a ERROR + dead-letter en vez de requeue | `pilar2/miner/miner.py`, `pilar2/worker/worker.py` |
+| Pool `PRECONDITION_FAILED` loop infinito | `auto_ack=True` → `False` en results consumer | `pilar2/pool/pool.py` |
+| `send_test_tx.py earn` nonce=0 siempre | Agregar query `/account/{pubkey}` para nonce | `pilar2/tools/send_test_tx.py` |
+| `GET /account/{pubkey}` 500 | Eliminar `.decode()` redundante (Redis `decode_responses=True`) | `pilar2/storage/chain_store.py` |
+
+### Decisiones de diseño cloud
+
+| # | Decisión | Fundamento |
+|---|---|---|
+| D1 | Mismo repo para infra y código | Consigna del TP |
+| D2 | OpenTofu solo GCP, kubectl para K8s | Separación limpia, sin chicken-and-egg |
+| D3 | AMQPS con certbot wildcard (Let's Encrypt) | Workers validan contra trust store del sistema |
+| D4 | LoadBalancer solo en RabbitMQ | Único servicio expuesto externamente |
+| D5 | NCT singleton (replicas: 1) | Coordinador único por diseño |
+| D6 | Workload Identity (GKE + GitHub OIDC) | Cero service account keys |
+| D7 | Redis StatefulSet con PVC + AOF | Persistencia de la cadena |
+| D8 | Sin NetworkPolicy en producción | Rompieron DNS y cert-manager en testing |
+| D9 | Secretos `.example` + gitignore | Templates versionados, valores nunca commiteados |
 
 ---
 
@@ -481,5 +567,10 @@ open http://localhost:15672  # guest / guest
 | Containerization | Docker + Docker Compose |
 | Testing | Python `unittest` + `MagicMock` |
 | HTTP API | FastAPI + Pydantic (strong request/response validation) |
-| Target cloud | Google Kubernetes Engine (GKE) via OpenTofu |
-| CI/CD | GitHub Actions (planned) |
+| Cloud | Google Kubernetes Engine (GKE) via OpenTofu |
+| CI/CD | GitHub Actions (gitleaks, Docker build) via Workload Identity Federation |
+| Secret scanning | gitleaks v8 (standalone binary, no license required) |
+| Container registry | Artifact Registry (Docker) |
+| TLS | cert-manager + Let's Encrypt (production wildcard) |
+| Ingress | nginx-ingress |
+| GitOps | kubectl (manifiestos declarativos en `pilar3/k8s/`) |
