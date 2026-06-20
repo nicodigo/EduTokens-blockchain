@@ -48,3 +48,52 @@ resource "google_project_iam_member" "github_actions_gke" {
   role    = "roles/container.developer"
   member  = "serviceAccount:${google_service_account.github_actions.email}"
 }
+
+# ────────────────────────────────────────────────────────────────────
+# Workload Identity Federation — GitHub Actions → GCP (OIDC)
+# Permite que GitHub Actions se autentique sin service account keys.
+# ────────────────────────────────────────────────────────────────────
+
+data "google_project" "current" {
+  project_id = var.project_id
+}
+
+resource "google_iam_workload_identity_pool" "github" {
+  provider                  = google
+  workload_identity_pool_id = "github-actions-oidc"
+  display_name              = "GitHub Actions OIDC"
+  description               = "Pool para federación OIDC con GitHub Actions — repo nicodigo/EduTokens-blockchain"
+  project                   = var.project_id
+  disabled                  = false
+
+  depends_on = [google_project_service.services]
+}
+
+resource "google_iam_workload_identity_pool_provider" "github" {
+  provider                           = google
+  workload_identity_pool_id          = google_iam_workload_identity_pool.github.workload_identity_pool_id
+  workload_identity_pool_provider_id = "github-actions-provider"
+  display_name                       = "GitHub Actions OIDC Provider"
+  description                        = "Proveedor OIDC para GitHub Actions — issuer token.actions.githubusercontent.com"
+  project                            = var.project_id
+
+  attribute_mapping = {
+    "google.subject"       = "assertion.sub"
+    "attribute.repository" = "assertion.repository"
+  }
+
+  attribute_condition = "assertion.repository.startsWith('nicodigo/')"
+
+  oidc {
+    issuer_uri = "https://token.actions.githubusercontent.com"
+  }
+
+  depends_on = [google_iam_workload_identity_pool.github]
+}
+
+# Permite que los workflows de nuestro repo asuman la SA github-actions
+resource "google_service_account_iam_member" "github_oidc" {
+  service_account_id = google_service_account.github_actions.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/projects/${data.google_project.current.number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.github.workload_identity_pool_id}/attribute.repository/nicodigo/EduTokens-blockchain"
+}

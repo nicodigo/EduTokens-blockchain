@@ -1,0 +1,39 @@
+# gitleaks.yml — Escaneo de secretos en cada push y PR
+#
+# Previene que claves privadas, tokens, o credenciales se commiteen
+# accidentalmente. Detecta ~150 patrones por defecto (AWS, GCP, GitHub
+# tokens, claves SSH, private keys, etc.).
+#
+# Usa el binario de gitleaks directamente (sin action externa) para
+# evitar dependencia de licencias. Funciona en repos personales y
+# organizaciones por igual.
+#
+# No requiere autenticación externa — es completamente standalone.
+
+name: Gitleaks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  scan:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # historial completo para detectar secretos en commits viejos
+
+      - name: Install gitleaks
+        run: |
+          GITLEAKS_VERSION=8.27.0
+          wget -q -O gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar xzf gitleaks.tar.gz gitleaks
+          echo "$PWD" >> $GITHUB_PATH
+
+      - name: Detect secrets
+        run: gitleaks detect --source . --verbose --redact
