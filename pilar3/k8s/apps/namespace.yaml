@@ -1,8 +1,0 @@
-# Namespace: apps
-# Frontend + API — único namespace con tráfico HTTPS desde internet
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: apps
-  labels:
-    name: apps

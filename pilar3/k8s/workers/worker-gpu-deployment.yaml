@@ -24,7 +24,7 @@ spec:
       containers:
       - name: worker-gpu
         image: us-central1-docker.pkg.dev/edutokens-2026/edutokens-repo/worker-gpu:latest
-        imagePullPolicy: Always
+        imagePullPolicy: IfNotPresent
         ports:
         - name: health
           containerPort: 8081
