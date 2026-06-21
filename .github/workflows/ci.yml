@@ -1,18 +1,17 @@
-# ci.yml — Build y push de imágenes Docker a Artifact Registry
+# ci.yml — Build, Push & Deploy de EduTokens-blockchain a GKE
 #
 # Triggers:
-#   push a main         → build + push de las 4 imágenes
+#   push a main         → build + push + deploy automático
 #   pull_request a main → solo build (verifica que compilan, sin pushear)
 #
 # Autenticación a GCP vía Workload Identity Federation (OIDC).
 # Cero service account keys — el token OIDC lo emite GitHub Actions
 # y GCP lo valida contra el pool github-actions-oidc.
 #
-# Workload Identity Provider:
-#   projects/381458252403/locations/global/workloadIdentityPools/
-#     github-actions-oidc/providers/github-actions-provider
+# ⚠️  Requisito previo: el SA github-actions@edutokens-2026.iam.gserviceaccount.com
+#     ya tiene roles/container.developer (definido en iam.tf).
 
-name: CI — Build & Push
+name: CI — Build, Push & Deploy
 
 on:
   push:
@@ -20,46 +19,45 @@ on:
   pull_request:
     branches: [main]
 
-# Para PRs desde forks: solo build, sin acceso a secrets
-# (Workload Identity Federation no funciona desde forks no confiables)
 env:
   REGISTRY: us-central1-docker.pkg.dev
   REPO: edutokens-2026/edutokens-repo
+  GKE_CLUSTER: edutokens-cluster
+  GKE_ZONE: us-central1-a
 
 jobs:
-  build-and-push:
-    name: Build images
+  build-push-deploy:
+    name: Build, Push & Deploy
     runs-on: ubuntu-latest
-    # Solo ejecutar GCP auth en eventos que no vienen de forks
-    # (los forks no tienen acceso a los secrets de Workload Identity)
     permissions:
       contents: read
-      id-token: write   # necesario para google-github-actions/auth
+      id-token: write   # WIF OIDC
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── GCP Authentication ──────────────────────────────────────────
-      # Solo en push a main (no en PRs desde forks)
+      # ── SHA tag (inmutable, único por commit) ─────────────────────
+      - name: Compute SHA tag
+        id: sha
+        run: echo "tag=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      # ── GCP Authentication ────────────────────────────────────────
       - name: Auth to GCP
         if: github.event_name == 'push'
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/381458252403/locations/global/workloadIdentityPools/github-actions-oidc/providers/github-actions-provider
           service_account: github-actions@edutokens-2026.iam.gserviceaccount.com
-          # token_format: access_token ya es el default
 
       - name: Configure Docker for Artifact Registry
         if: github.event_name == 'push'
         run: gcloud auth configure-docker $REGISTRY --quiet
 
-      # ── Buildx (container driver, necesario para cache export) ──────
+      # ── Buildx ────────────────────────────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ── Build & Push helpers ────────────────────────────────────────
-      # push=true solo en push a main; en PR solo build (push=false)
       - name: Set push flag
         id: flags
         run: |
@@ -69,47 +67,92 @@ jobs:
             echo "push=false" >> $GITHUB_OUTPUT
           fi
 
-      # ── NCT (coordinador de la blockchain) ──────────────────────────
+      # ── NCT (coordinador de la blockchain) ────────────────────────
       - name: Build NCT
         uses: docker/build-push-action@v6
         with:
           context: pilar2/
           file: pilar2/nct/Dockerfile
           push: ${{ steps.flags.outputs.push }}
-          tags: ${{ env.REGISTRY }}/${{ env.REPO }}/nct:latest
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REPO }}/nct:latest
+            ${{ env.REGISTRY }}/${{ env.REPO }}/nct:${{ steps.sha.outputs.tag }}
           cache-from: type=gha,scope=nct
           cache-to: ${{ steps.flags.outputs.push == 'true' && 'type=gha,mode=max,scope=nct' || '' }}
 
-      # ── Pool (distribuidor de trabajo de minado) ────────────────────
+      # ── Pool (distribuidor de trabajo de minado) ──────────────────
       - name: Build Pool
         uses: docker/build-push-action@v6
         with:
           context: pilar2/
           file: pilar2/pool/Dockerfile
           push: ${{ steps.flags.outputs.push }}
-          tags: ${{ env.REGISTRY }}/${{ env.REPO }}/pool:latest
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REPO }}/pool:latest
+            ${{ env.REGISTRY }}/${{ env.REPO }}/pool:${{ steps.sha.outputs.tag }}
           cache-from: type=gha,scope=pool
           cache-to: ${{ steps.flags.outputs.push == 'true' && 'type=gha,mode=max,scope=pool' || '' }}
 
-      # ── Worker CPU (miner de respaldo, solo CPU) ────────────────────
+      # ── Worker CPU (miner de respaldo, solo CPU) ──────────────────
       - name: Build Worker CPU
         uses: docker/build-push-action@v6
         with:
           context: pilar2/
           file: pilar2/worker/Dockerfile
           push: ${{ steps.flags.outputs.push }}
-          tags: ${{ env.REGISTRY }}/${{ env.REPO }}/worker-cpu:latest
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REPO }}/worker-cpu:latest
+            ${{ env.REGISTRY }}/${{ env.REPO }}/worker-cpu:${{ steps.sha.outputs.tag }}
           cache-from: type=gha,scope=worker-cpu
           cache-to: ${{ steps.flags.outputs.push == 'true' && 'type=gha,mode=max,scope=worker-cpu' || '' }}
 
-      # ── Worker GPU (miner CUDA, RTX 4060 sm_89) ─────────────────────
-      # Build context: repo root (necesita pilar1/ + pilar2/)
+      # ── Worker GPU (miner CUDA, RTX 4060 sm_89) ───────────────────
       - name: Build Worker GPU
         uses: docker/build-push-action@v6
         with:
           context: .
           file: pilar3/docker/worker-gpu.Dockerfile
           push: ${{ steps.flags.outputs.push }}
-          tags: ${{ env.REGISTRY }}/${{ env.REPO }}/worker-gpu:latest
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REPO }}/worker-gpu:latest
+            ${{ env.REGISTRY }}/${{ env.REPO }}/worker-gpu:${{ steps.sha.outputs.tag }}
           cache-from: type=gha,scope=worker-gpu
           cache-to: ${{ steps.flags.outputs.push == 'true' && 'type=gha,mode=max,scope=worker-gpu' || '' }}
+
+      # ── Stamp image SHAs into manifests ───────────────────────────
+      - name: Install yq
+        if: github.event_name == 'push'
+        run: |
+          wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
+
+      - name: Stamp SHA into deployment manifests
+        if: github.event_name == 'push'
+        run: |
+          SHA="${{ steps.sha.outputs.tag }}"
+          REG="${{ env.REGISTRY }}/${{ env.REPO }}"
+
+          yq -i ".spec.template.spec.containers[0].image = \"${REG}/nct:${SHA}\""        pilar3/k8s/blockchain/nct-deployment.yaml
+          yq -i ".spec.template.spec.containers[0].image = \"${REG}/pool:${SHA}\""       pilar3/k8s/blockchain/pool-deployment.yaml
+          yq -i ".spec.template.spec.containers[0].image = \"${REG}/worker-gpu:${SHA}\"" pilar3/k8s/workers/worker-gpu-deployment.yaml
+
+          echo "Stamped manifests with SHA: ${SHA}"
+
+      # ── Deploy to GKE ─────────────────────────────────────────────
+      - name: Get GKE credentials
+        if: github.event_name == 'push'
+        run: gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE
+
+      - name: Deploy to GKE
+        if: github.event_name == 'push'
+        run: |
+          kubectl apply -f pilar3/k8s/infra/
+          kubectl apply -f pilar3/k8s/blockchain/
+          kubectl apply -f pilar3/k8s/workers/
+          kubectl apply -f pilar3/k8s/ingress.yaml
+
+      - name: Verify rollout
+        if: github.event_name == 'push'
+        run: |
+          kubectl -n blockchain rollout status deployment/nct    --timeout=120s
+          kubectl -n blockchain rollout status deployment/pool-a --timeout=120s
