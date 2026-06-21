@@ -1,0 +1,21 @@
+# Backend ConfigMap — configuración no sensible de EduTokens-app
+# NOTA: DATABASE_URL se define inline en el Deployment porque requiere
+# expansión de variable $(POSTGRES_PASSWORD) que solo funciona en env[].
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: apps
+  labels:
+    app: backend
+data:
+  # NCT (Nodo Coordinador de Transacciones — blockchain)
+  NCT_BASE_URL: "http://nct.blockchain.svc.cluster.local:8080"
+
+  # JWT
+  JWT_ALGORITHM: "HS256"
+  JWT_EXPIRE_MINUTES: "60"
+
+  # Auth
+  AUTH_CHALLENGE_WINDOW_SECONDS: "60"
+  DEBUG: "False"

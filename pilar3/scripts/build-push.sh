@@ -2,11 +2,13 @@
 # build-push.sh — Build y push de imágenes Docker a Artifact Registry
 # Uso: ./pilar3/scripts/build-push.sh
 # Requiere: gcloud auth configure-docker us-central1-docker.pkg.dev ejecutado antes
+#
+# Solo construye las imágenes del repo blockchain (nct, pool, worker-cpu, worker-gpu).
+# Las imágenes de EduTokens-app (backend, frontend) se construyen desde su propio repo.
 
 set -euo pipefail
 
 REGISTRY="us-central1-docker.pkg.dev/edutokens-2026/edutokens-repo"
-# Nota: el project ID correcto es edutokens-2026 (con guion y año)
 PILAR2="$(cd "$(dirname "$0")/../../pilar2" && pwd)"
 
 echo "==> Autenticando contra Artifact Registry..."

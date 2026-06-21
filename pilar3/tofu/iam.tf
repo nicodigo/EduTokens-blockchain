@@ -62,7 +62,7 @@ resource "google_iam_workload_identity_pool" "github" {
   provider                  = google
   workload_identity_pool_id = "github-actions-oidc"
   display_name              = "GitHub Actions OIDC"
-  description               = "Pool para federación OIDC con GitHub Actions — repo nicodigo/EduTokens-blockchain"
+  description               = "Pool para federación OIDC con GitHub Actions — nicodigo/EduTokens-blockchain + MariaNazarenaGonzalez/eduTockens"
   project                   = var.project_id
   disabled                  = false
 
@@ -82,7 +82,7 @@ resource "google_iam_workload_identity_pool_provider" "github" {
     "attribute.repository" = "assertion.repository"
   }
 
-  attribute_condition = "assertion.repository.startsWith('nicodigo/')"
+  attribute_condition = "assertion.repository.startsWith('nicodigo/') || assertion.repository.startsWith('MariaNazarenaGonzalez/')"
 
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
@@ -96,4 +96,11 @@ resource "google_service_account_iam_member" "github_oidc" {
   service_account_id = google_service_account.github_actions.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "principalSet://iam.googleapis.com/projects/${data.google_project.current.number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.github.workload_identity_pool_id}/attribute.repository/nicodigo/EduTokens-blockchain"
+}
+
+# Permite que el repo de la app (MariaNazarenaGonzalez/eduTockens) asuma la SA github-actions
+resource "google_service_account_iam_member" "github_oidc_app" {
+  service_account_id = google_service_account.github_actions.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/projects/${data.google_project.current.number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.github.workload_identity_pool_id}/attribute.repository/MariaNazarenaGonzalez/eduTockens"
 }
