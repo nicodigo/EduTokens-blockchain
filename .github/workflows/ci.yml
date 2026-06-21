@@ -141,7 +141,10 @@ jobs:
       # ── Deploy to GKE ─────────────────────────────────────────────
       - name: Get GKE credentials
         if: github.event_name == 'push'
-        run: gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GKE_ZONE }}
 
       - name: Deploy to GKE
         if: github.event_name == 'push'
