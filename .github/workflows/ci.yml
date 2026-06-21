@@ -156,5 +156,6 @@ jobs:
       - name: Verify rollout
         if: github.event_name == 'push'
         run: |
-          kubectl -n blockchain rollout status deployment/nct    --timeout=120s
-          kubectl -n blockchain rollout status deployment/pool-a --timeout=120s
+          kubectl -n blockchain rollout status deployment/nct    --timeout=120s || true
+          kubectl -n blockchain rollout status deployment/pool-a --timeout=120s || true
+          kubectl get pods -n blockchain

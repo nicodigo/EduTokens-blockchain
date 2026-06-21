@@ -10,6 +10,8 @@ metadata:
     app: pool-a
 spec:
   replicas: 1
+  strategy:
+    type: Recreate   # singleton: matar el viejo antes de crear el nuevo
   selector:
     matchLabels:
       app: pool-a
@@ -48,7 +50,7 @@ spec:
         resources:
           requests:
             memory: "128Mi"
-            cpu: "250m"
+            cpu: "100m"
           limits:
             memory: "256Mi"
             cpu: "500m"
