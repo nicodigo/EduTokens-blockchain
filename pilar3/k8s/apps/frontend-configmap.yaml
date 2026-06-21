@@ -33,9 +33,9 @@ data:
             client_max_body_size 5M;
         }
 
-        # Health check endpoint (no auth required)
+        # Health check — estático (sin depender del backend)
         location /health {
-            proxy_pass http://backend.apps.svc.cluster.local:8000/health;
-            proxy_set_header Host $host;
+            return 200 "healthy\n";
+            add_header Content-Type text/plain;
         }
     }
