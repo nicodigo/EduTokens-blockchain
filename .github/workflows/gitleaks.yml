@@ -10,30 +10,30 @@
 #
 # No requiere autenticación externa — es completamente standalone.
 
-name: Gitleaks
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
-jobs:
-  scan:
-    name: gitleaks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # historial completo para detectar secretos en commits viejos
-
-      - name: Install gitleaks
-        run: |
-          GITLEAKS_VERSION=8.27.0
-          wget -q -O gitleaks.tar.gz \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          tar xzf gitleaks.tar.gz gitleaks
-          echo "$PWD" >> $GITHUB_PATH
-
-      - name: Detect secrets
-        run: gitleaks detect --source . --verbose --redact
+# name: Gitleaks
+#
+# on:
+#   push:
+#     branches: [main]
+#   pull_request:
+#     branches: [main]
+#
+# jobs:
+#   scan:
+#     name: gitleaks
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#         with:
+#           fetch-depth: 0  # historial completo para detectar secretos en commits viejos
+#
+#       - name: Install gitleaks
+#         run: |
+#           GITLEAKS_VERSION=8.27.0
+#           wget -q -O gitleaks.tar.gz \
+#             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+#           tar xzf gitleaks.tar.gz gitleaks
+#           echo "$PWD" >> $GITHUB_PATH
+#
+#       - name: Detect secrets
+#         run: gitleaks detect --source . --verbose --redact

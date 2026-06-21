@@ -151,7 +151,6 @@ jobs:
         run: |
           kubectl apply -f pilar3/k8s/infra/
           kubectl apply -f pilar3/k8s/blockchain/
-          kubectl apply -f pilar3/k8s/workers/
           kubectl apply -f pilar3/k8s/ingress.yaml
 
       - name: Verify rollout
