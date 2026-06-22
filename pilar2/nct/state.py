@@ -27,6 +27,7 @@ class NCTConfig:
     heartbeat_timeout: float = 15.0
     heartbeat_interval: float = 5.0
     pool_timeout: float = 60.0     # audit H2: seconds before pool considered dead
+    max_nonce_window: int = 100    # max nonce gap accepted at POST time
     rate_limit: str = "100/minute"
 
 
@@ -140,6 +141,32 @@ class NCTState:
     def pool_snapshot(self) -> list[Transaction]:
         with self.tx_lock:
             return list(self._tx_pool)
+
+    def remove_transactions(self, tx_ids: set[str]) -> None:
+        """Remove transactions with the given tx_ids from the pool.
+
+        Used by ``drain_pool_validated`` after processing a snapshot —
+        only transactions that were accepted or definitively discarded
+        are removed.  Gap (future-nonce) transactions stay in the pool.
+        """
+        if not tx_ids:
+            return
+        with self.tx_lock:
+            self._tx_pool = [
+                tx for tx in self._tx_pool
+                if tx.tx_id not in tx_ids
+            ]
+
+    def get_sender_nonces(self, pubkey: str) -> list[int]:
+        """Return sorted nonces for *pubkey* currently in the pool.
+
+        Used by ``GET /account/{pubkey}`` to compute ``pending_nonce``.
+        """
+        with self.tx_lock:
+            return sorted(
+                tx.nonce for tx in self._tx_pool
+                if tx.sender_pubkey == pubkey
+            )
 
     # ------------------------------------------------------------------
     # Worker registry (keep-alive)

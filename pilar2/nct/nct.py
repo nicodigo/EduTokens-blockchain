@@ -100,6 +100,7 @@ def load_config() -> NCTConfig:
         block_timeout=env_float("BLOCK_TIMEOUT", 30.0),
         difficulty=difficulty,
         nonce_space=env_int("NONCE_SPACE", 1_000_000_000),
+        max_nonce_window=env_int("MAX_NONCE_WINDOW", 100, min_val=1),
         port=env_int("PORT", 8080),
         rate_limit=os.getenv("RATE_LIMIT", "100/minute"),
         authority_pubkey=authority_pubkey,
@@ -109,78 +110,119 @@ def load_config() -> NCTConfig:
 def drain_pool_validated(
     state: NCTState,
     redis_client: Any,
-    max_count: int,
 ) -> list[Transaction]:
-    """Drain the transaction pool applying balance validation for SPEND txns.
+    """Drain the transaction pool applying balance and nonce validation.
+
+    Takes a snapshot of the pool, groups transactions by sender, sorts
+    each group by nonce, and processes them in order.  This enables
+    multiple transactions from the same sender to be included in a single
+    block when their nonces are contiguous.
 
     Maintains an in-memory *overlay* that tracks per-student deltas
     accumulated during this block's assembly.  This prevents double-spend
     within a single block without requiring synchronous balance checks at
     POST time.
 
-    EARN transactions are always accepted (structural validation already
-    passed).  SPEND transactions are accepted only when::
+    EARN transactions are always accepted (authority check already passed
+    at POST time).  SPEND transactions are accepted only when::
 
         confirmed_balance + overlay_delta >= amount
 
-    Discarded transactions are **not** returned to the pool — the client
-    must re-send the POST if it wants to retry.
+    Transactions with a nonce *lower* than the sender's current on-chain
+    nonce are discarded as replays.  Transactions with a nonce *higher*
+    than the next expected nonce (gap) stay in the pool until the missing
+    nonce arrives — they are **not** discarded.
+
+    Returns only the transactions that passed all validations and are
+    ready to be included in a block.
     """
-    candidates = state.drain_pool(max_count)
-    overlay: dict[str, int] = {}   # student_id → accumulated delta in this block
-    nonce_overlay: dict[str, int] = {}  # sender_pubkey → next expected nonce in this block
-    valid: list[Transaction] = []
-    discarded: list[Transaction] = []
+    # Phase 1 — snapshot (does not modify the pool yet)
+    candidates = state.pool_snapshot()
 
+    # Phase 2 — group by sender and sort each group by nonce
+    by_sender: dict[str, list[Transaction]] = {}
     for tx in candidates:
-        # Nonce validation — reject if nonce was already consumed
-        # (e.g. another transaction from same sender mined between POST and now,
-        #  or another tx from the same sender already accepted in this block)
-        current_nonce = get_nonce(redis_client, tx.sender_pubkey)
-        expected = nonce_overlay.get(tx.sender_pubkey, current_nonce)
-        if tx.nonce != expected:
-            discarded.append(tx)
-            logger.warning(
-                "TX descartada — nonce inválido: sender=%s esperado=%d recibido=%d",
-                tx.sender_pubkey, expected, tx.nonce,
-            )
-            continue
+        by_sender.setdefault(tx.sender_pubkey, []).append(tx)
+    for txs in by_sender.values():
+        txs.sort(key=lambda tx: tx.nonce)
 
-        # Advance nonce for this sender within the block
-        nonce_overlay[tx.sender_pubkey] = tx.nonce + 1
+    # Phase 3 — validate per sender in nonce order
+    overlay: dict[str, int] = {}       # pubkey → accumulated delta in this block
+    valid: list[Transaction] = []
+    gap: list[Transaction] = []
+    discarded: list[Transaction] = []
+    removed_ids: set[str] = set()
 
-        if tx.tx_type == "EARN":
-            valid.append(tx)
-            overlay[tx.receiver_pubkey] = overlay.get(tx.receiver_pubkey, 0) + tx.amount
+    for sender_pubkey, txs in by_sender.items():
+        current_nonce = get_nonce(redis_client, sender_pubkey)
 
-        elif tx.tx_type == "SPEND":
-            confirmed = get_balance(redis_client, tx.sender_pubkey)
-            in_flight = overlay.get(tx.sender_pubkey, 0)
-            effective = confirmed + in_flight
-
-            if effective >= tx.amount:
-                valid.append(tx)
-                overlay[tx.sender_pubkey] = in_flight - tx.amount
-            else:
+        for tx in txs:
+            if tx.nonce < current_nonce:
+                # Replay — nonce already consumed on-chain
                 discarded.append(tx)
+                removed_ids.add(tx.tx_id)
                 logger.warning(
-                    "SPEND descartado — saldo insuficiente: sender=%s "
-                    "confirmado=%d en_vuelo=%d requerido=%d concept=%s",
-                    tx.sender_pubkey, confirmed, in_flight, tx.amount, tx.concept,
+                    "TX descartada — replay: sender=%s nonce=%d current=%d",
+                    tx.sender_pubkey, tx.nonce, current_nonce,
                 )
 
-    if discarded:
-        logger.info("%d transacción(es) descartada(s) por saldo insuficiente", len(discarded))
-        # Audit M2: record discarded tx_ids so clients can discover them
-        for tx in discarded:
-            add_discarded_tx(redis_client, tx.sender_pubkey, tx.tx_id)
+            elif tx.nonce == current_nonce:
+                # Correct nonce — validate balance for SPEND
+                if tx.tx_type == "EARN":
+                    valid.append(tx)
+                    overlay[tx.receiver_pubkey] = (
+                        overlay.get(tx.receiver_pubkey, 0) + tx.amount
+                    )
 
-    # Audit L2: remove drained transactions from Redis so they are not
-    # re-queued on restart.  The count is (valid + discarded) — everything
-    # that was taken out of the pool.
+                elif tx.tx_type == "SPEND":
+                    confirmed = get_balance(redis_client, tx.sender_pubkey)
+                    in_flight = overlay.get(tx.sender_pubkey, 0)
+                    effective = confirmed + in_flight
+
+                    if effective >= tx.amount:
+                        valid.append(tx)
+                        overlay[tx.sender_pubkey] = in_flight - tx.amount
+                    else:
+                        discarded.append(tx)
+                        logger.warning(
+                            "SPEND descartado — saldo insuficiente: sender=%s "
+                            "confirmado=%d en_vuelo=%d requerido=%d concept=%s",
+                            tx.sender_pubkey, confirmed, in_flight,
+                            tx.amount, tx.concept,
+                        )
+
+                removed_ids.add(tx.tx_id)
+                current_nonce += 1
+
+            else:  # tx.nonce > current_nonce → gap
+                gap.append(tx)
+                # NOT added to removed_ids — stays in the pool
+                logger.debug(
+                    "TX en espera (gap): sender=%s nonce=%d esperado=%d",
+                    tx.sender_pubkey, tx.nonce, current_nonce,
+                )
+
+    # Phase 4 — clean up pool and Redis pending list
+    state.remove_transactions(removed_ids)
+
     drained_count = len(valid) + len(discarded)
     if drained_count > 0:
         trim_pending_txs(redis_client, drained_count)
+
+    # Audit M2: record discarded tx_ids so clients can discover them
+    for tx in discarded:
+        add_discarded_tx(redis_client, tx.sender_pubkey, tx.tx_id)
+
+    if discarded:
+        logger.info(
+            "%d transacción(es) descartada(s) (replay o saldo insuficiente)",
+            len(discarded),
+        )
+    if gap:
+        logger.info(
+            "%d tx(s) en espera por gap de nonce — permanecen en pool",
+            len(gap),
+        )
 
     return valid
 
@@ -252,24 +294,49 @@ def accumulate_transactions(
     redis_client: Any,
     config: NCTConfig,
 ) -> list[Transaction]:
-    """Block until the transaction pool meets the threshold or a timeout is reached.
+    """Block until the transaction pool yields valid transactions.
 
-    At least one transaction is required; returns an empty list only on shutdown.
-    Transactions are validated for sufficient balance via ``drain_pool_validated``.
+    Waits for at least one transaction to arrive, then for the pool to
+    reach ``block_size`` or the ``block_timeout`` to expire.  Calls
+    ``drain_pool_validated`` to extract mineable transactions.
+
+    If the pool contains only gap (future-nonce) transactions,
+    ``drain_pool_validated`` returns an empty list.  This function then
+    enters a backoff loop — waiting for new transactions to arrive that
+    might fill the gap — rather than tight-looping.
+
+    Returns an empty list only on shutdown.
     """
-    # Wait for at least one transaction
-    while state.pool_size() == 0 and not state.shutdown.is_set():
-        time.sleep(0.5)
+    while not state.shutdown.is_set():
+        # Wait for at least one transaction
+        while state.pool_size() == 0 and not state.shutdown.is_set():
+            time.sleep(0.5)
 
-    if state.shutdown.is_set():
-        return []
+        if state.shutdown.is_set():
+            return []
 
-    # Wait until BLOCK_SIZE is reached or BLOCK_TIMEOUT expires
-    deadline = time.time() + config.block_timeout
-    while state.pool_size() < config.block_size and time.time() < deadline:
-        time.sleep(0.5)
+        # Wait until BLOCK_SIZE is reached or BLOCK_TIMEOUT expires
+        deadline = time.time() + config.block_timeout
+        while state.pool_size() < config.block_size and time.time() < deadline:
+            time.sleep(0.5)
 
-    return drain_pool_validated(state, redis_client, config.block_size)
+        txs = drain_pool_validated(state, redis_client)
+        if txs:
+            return txs
+
+        # Pool had transactions but none were mineable (all gapped).
+        # Avoid tight loop — wait before retrying.
+        if state.pool_size() == 0:
+            continue  # pool was drained, go back to waiting for new txs
+
+        logger.info(
+            "Pool tiene %d tx(s) no mineables (gaps de nonce) — esperando…",
+            state.pool_size(),
+        )
+        # Wait with backoff; break early on shutdown
+        state.shutdown.wait(timeout=2.0)
+
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -613,13 +680,26 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
                 ).model_dump(),
             )
 
-        # 3. Nonce validation — prevents replay attacks
+        # 3. Nonce validation — prevents replay attacks and limits future nonces
         current_nonce = get_nonce(redis_client, t.sender_pubkey)
-        if t.nonce != current_nonce:
+        if t.nonce < current_nonce:
             return JSONResponse(
                 status_code=400,
                 content=ErrorResponse(
-                    error=f"invalid nonce: expected {current_nonce}, got {t.nonce}"
+                    error=(
+                        f"nonce {t.nonce} already consumed "
+                        f"(current: {current_nonce})"
+                    )
+                ).model_dump(),
+            )
+        if t.nonce > current_nonce + config.max_nonce_window:
+            return JSONResponse(
+                status_code=400,
+                content=ErrorResponse(
+                    error=(
+                        f"nonce {t.nonce} too far ahead of current {current_nonce} "
+                        f"(max gap: {config.max_nonce_window})"
+                    )
                 ).model_dump(),
             )
 
@@ -654,16 +734,39 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
 
     @app.get("/account/{pubkey}", response_model=AccountResponse)
     def get_account(pubkey: str) -> AccountResponse:
-        """Return balance, nonce, and discarded transaction ids (audit M2)."""
+        """Return balance, nonce, pending_nonce, and discarded transaction ids.
+
+        *nonce* is the confirmed on-chain nonce (next nonce valid in a block).
+        *pending_nonce* advances past contiguous pending transactions in the
+        mempool.  When it is larger than *nonce*, the client may submit
+        transactions with nonces up to ``pending_nonce - 1`` without waiting
+        for confirmation.  A gap is indicated when ``pending_nonce`` points
+        to a missing nonce (it is smaller than ``nonce + len(pool_nonces)``).
+        """
         from shared.crypto import pubkey_to_address
 
         balance = get_balance(redis_client, pubkey)
-        nonce = get_nonce(redis_client, pubkey)
+        confirmed = get_nonce(redis_client, pubkey)
         discarded = get_discarded_txns(redis_client, pubkey)
+
+        # Compute pending_nonce: confirmed + contiguous pool nonces
+        pool_nonces = state.get_sender_nonces(pubkey)
+        pending = confirmed
+        for n in pool_nonces:
+            if n == pending:
+                pending += 1
+            elif n < pending:
+                # Replay — nonce already consumed on-chain; skip
+                continue
+            else:
+                # Gap — n > pending, stop
+                break
+
         return AccountResponse(
             address=pubkey_to_address(pubkey),
             balance=balance,
-            nonce=nonce,
+            nonce=confirmed,
+            pending_nonce=pending,
             discarded_transactions=discarded,
         )
 

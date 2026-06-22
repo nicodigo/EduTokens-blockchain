@@ -39,7 +39,15 @@ class AccountResponse(BaseModel):
         description="Public-key derived address (24 hex chars)",
     )
     balance: int
-    nonce: int = Field(..., ge=0, description="Next expected nonce for this account")
+    nonce: int = Field(..., ge=0, description="Next confirmed nonce (on-chain)")
+    pending_nonce: int = Field(
+        ..., ge=0,
+        description="Next nonce available for submission. "
+        "Equals nonce when no pending transactions exist; "
+        "advances past contiguous pending transactions in the mempool; "
+        "stops at the first gap. "
+        "Clients should use this value for their next transaction nonce.",
+    )
     discarded_transactions: list[str] = Field(
         default_factory=list,
         description="tx_ids of transactions from this account "

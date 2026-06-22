@@ -658,7 +658,7 @@ class TestSchemaValidation(unittest.TestCase):
     def test_account_response_accepts_valid_address(self):
         from shared.schemas import AccountResponse
 
-        resp = AccountResponse(address="f" * 24, balance=50, nonce=3)
+        resp = AccountResponse(address="f" * 24, balance=50, nonce=3, pending_nonce=5)
         self.assertEqual(resp.address, "f" * 24)
         self.assertEqual(resp.balance, 50)
         self.assertEqual(resp.nonce, 3)

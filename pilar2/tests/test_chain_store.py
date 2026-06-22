@@ -401,7 +401,7 @@ class TestPendingTxPersistence(unittest.TestCase):
 # Discarded transaction tracking (audit M2)
 # ---------------------------------------------------------------------------
 
-DISCARDED_PREFIX = "blockchain:discarded:"
+DISCARDED_PREFIX = "discarded:"
 
 
 class TestDiscardedTransactions(unittest.TestCase):
@@ -418,7 +418,7 @@ class TestDiscardedTransactions(unittest.TestCase):
 
         result = get_discarded_txns(client, self.pubkey)
 
-        self.assertEqual(result, ["tx-abc123", "tx-def456"])
+        self.assertEqual(set(result), {"tx-abc123", "tx-def456"})
         client.smembers.assert_called_once_with(
             f"{DISCARDED_PREFIX}{self.pubkey}"
         )

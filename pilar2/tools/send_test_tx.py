@@ -165,6 +165,7 @@ def cmd_gen() -> None:
 
 def cmd_spend(
     privkey_hex: str, receiver_pubkey: str, amount: int, concept: str,
+    nonce_override: int | None = None,
 ) -> None:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import (
         Ed25519PrivateKey,
@@ -178,8 +179,14 @@ def cmd_spend(
     except SystemExit:
         print("Could not reach NCT. Is docker compose up?")
         sys.exit(1)
-    nonce = account.get("nonce", 0)
-    print(f"Current nonce for {sender_pubkey[:16]}...: {nonce}")
+    confirmed = account.get("nonce", 0)
+    pending = account.get("pending_nonce", confirmed)
+    print(f"Sender:        {sender_pubkey[:16]}...")
+    print(f"  confirmed_nonce: {confirmed}")
+    print(f"  pending_nonce:   {pending}")
+
+    nonce = nonce_override if nonce_override is not None else pending
+    print(f"  using nonce:     {nonce}")
 
     body = sign_transaction(
         privkey_hex, sender_pubkey, receiver_pubkey, amount,
@@ -193,13 +200,14 @@ def cmd_spend(
 
 def cmd_earn(
     privkey_hex: str, student_pubkey: str, amount: int, concept: str,
+    nonce_override: int | None = None,
 ) -> None:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import (
         Ed25519PrivateKey,
     )
     sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(privkey_hex))
     authority_pubkey = sk.public_key().public_bytes_raw().hex()
-    print(f"Authority pubkey: {authority_pubkey}")
+    print(f"Authority pubkey: {authority_pubkey[:16]}...")
 
     # Get current nonce for the authority
     try:
@@ -207,8 +215,13 @@ def cmd_earn(
     except SystemExit:
         print("Could not reach NCT. Is docker compose up?")
         sys.exit(1)
-    nonce = account.get("nonce", 0)
-    print(f"Current nonce for authority: {nonce}")
+    confirmed = account.get("nonce", 0)
+    pending = account.get("pending_nonce", confirmed)
+    print(f"  confirmed_nonce: {confirmed}")
+    print(f"  pending_nonce:   {pending}")
+
+    nonce = nonce_override if nonce_override is not None else pending
+    print(f"  using nonce:     {nonce}")
 
     body = sign_transaction(
         privkey_hex, authority_pubkey, student_pubkey, amount,
@@ -240,10 +253,27 @@ def cmd_balance(pubkey: str) -> None:
 
 USAGE = """Usage:
   python tools/send_test_tx.py gen
-  python tools/send_test_tx.py spend <privkey> <receiver_pubkey> <amount> <concept>
-  python tools/send_test_tx.py earn <privkey> <student_pubkey> <amount> <concept>
+  python tools/send_test_tx.py spend <privkey> <receiver_pubkey> <amount> <concept> [--nonce N]
+  python tools/send_test_tx.py earn <privkey> <student_pubkey> <amount> <concept> [--nonce N]
   python tools/send_test_tx.py status
-  python tools/send_test_tx.py balance <pubkey>"""
+  python tools/send_test_tx.py balance <pubkey>
+
+  --nonce N   Override the nonce (default: uses pending_nonce from /account)"""
+
+
+def _parse_nonce_override(args: list[str]) -> tuple[int | None, list[str]]:
+    """Extract --nonce N from args, returning (nonce, remaining_args)."""
+    nonce: int | None = None
+    remaining: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--nonce" and i + 1 < len(args):
+            nonce = int(args[i + 1])
+            i += 2
+        else:
+            remaining.append(args[i])
+            i += 1
+    return nonce, remaining
 
 
 def main() -> None:
@@ -252,26 +282,31 @@ def main() -> None:
         sys.exit(1)
 
     cmd = sys.argv[1]
+    args = sys.argv[2:]
 
     if cmd == "gen":
         cmd_gen()
     elif cmd == "spend":
-        if len(sys.argv) != 6:
+        nonce, args = _parse_nonce_override(args)
+        if len(args) != 4:
             print(USAGE)
             sys.exit(1)
-        cmd_spend(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5])
+        cmd_spend(args[0], args[1], int(args[2]), args[3],
+                  nonce_override=nonce)
     elif cmd == "earn":
-        if len(sys.argv) != 6:
+        nonce, args = _parse_nonce_override(args)
+        if len(args) != 4:
             print(USAGE)
             sys.exit(1)
-        cmd_earn(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5])
+        cmd_earn(args[0], args[1], int(args[2]), args[3],
+                 nonce_override=nonce)
     elif cmd == "status":
         cmd_status()
     elif cmd == "balance":
-        if len(sys.argv) != 3:
+        if len(args) != 1:
             print(USAGE)
             sys.exit(1)
-        cmd_balance(sys.argv[2])
+        cmd_balance(args[0])
     else:
         print(f"Unknown command: {cmd}")
         print(USAGE)

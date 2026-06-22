@@ -1,5 +1,7 @@
 """Unit tests for NCT components (PKI-aware)."""
 
+from __future__ import annotations
+
 import json
 import time
 import unittest
@@ -227,7 +229,7 @@ class TestNonceValidation(unittest.TestCase):
         tx.signature = sign(self.uni_priv, tx.tx_id.encode())
         state.add_transaction(tx)
 
-        result = drain_pool_validated(state, redis_mock, 5)
+        result = drain_pool_validated(state, redis_mock)
         self.assertEqual(result, [], "stale nonce should be rejected")
 
     def test_drain_pool_accepts_correct_nonce(self):
@@ -243,7 +245,7 @@ class TestNonceValidation(unittest.TestCase):
         tx.signature = sign(self.uni_priv, tx.tx_id.encode())
         state.add_transaction(tx)
 
-        result = drain_pool_validated(state, redis_mock, 5)
+        result = drain_pool_validated(state, redis_mock)
         self.assertEqual(len(result), 1)
 
     def test_drain_pool_accepts_default_nonce_zero(self):
@@ -259,7 +261,7 @@ class TestNonceValidation(unittest.TestCase):
         tx.signature = sign(self.uni_priv, tx.tx_id.encode())
         state.add_transaction(tx)
 
-        result = drain_pool_validated(state, redis_mock, 5)
+        result = drain_pool_validated(state, redis_mock)
         self.assertEqual(len(result), 1)
 
     def test_handle_result_updates_nonces(self):
@@ -588,7 +590,7 @@ class TestDiscardedTransactionPersistence(unittest.TestCase):
 
     def test_add_and_retrieve_discarded(self):
         client = MagicMock()
-        client.smembers.return_value = {b"tx-001", b"tx-002"}
+        client.smembers.return_value = {"tx-001", "tx-002"}
         pubkey = "a" * 24  # 24-char hex (valid for address validation)
 
         txn = get_discarded_txns(client, pubkey)
@@ -1051,6 +1053,604 @@ class TestRabbitMQReconnectionInLoops(unittest.TestCase):
 
         self.assertEqual(attempt[0], 2, "Should have retried once after reconnect")
         self.assertEqual(reconnect_count[0], 1, "Should have reconnected once")
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Multi-transaction nonce support (state helpers)
+# ---------------------------------------------------------------------------
+
+
+class TestStateSenderNonces(unittest.TestCase):
+    """Tests for NCTState.get_sender_nonces() and remove_transactions()."""
+
+    def setUp(self):
+        self.state = NCTState()
+        self.priv_a, self.pub_a, _ = make_keypair()
+        self.priv_b, self.pub_b, _ = make_keypair()
+
+    def _add_tx(self, sender_pub: str, nonce: int) -> Transaction:
+        tx = Transaction(
+            sender_pubkey=sender_pub,
+            receiver_pubkey="b" * 64,
+            amount=1,
+            tx_type="EARN",
+            concept="test",
+            nonce=nonce,
+        )
+        tx.signature = "a" * 128
+        self.state.add_transaction(tx)
+        return tx
+
+    def test_get_sender_nonces_empty_pool(self):
+        self.assertEqual(self.state.get_sender_nonces(self.pub_a), [])
+
+    def test_get_sender_nonces_sorted(self):
+        self._add_tx(self.pub_a, 2)
+        self._add_tx(self.pub_a, 1)
+        self._add_tx(self.pub_a, 3)
+        self.assertEqual(self.state.get_sender_nonces(self.pub_a), [1, 2, 3])
+
+    def test_get_sender_nonces_other_senders_ignored(self):
+        self._add_tx(self.pub_a, 1)
+        self._add_tx(self.pub_b, 5)
+        self._add_tx(self.pub_a, 2)
+        self.assertEqual(self.state.get_sender_nonces(self.pub_a), [1, 2])
+
+    def test_get_sender_nonces_unknown_sender(self):
+        self._add_tx(self.pub_a, 1)
+        self.assertEqual(self.state.get_sender_nonces(self.pub_b), [])
+
+    def test_remove_transactions_removes_specified(self):
+        tx1 = self._add_tx(self.pub_a, 1)
+        tx2 = self._add_tx(self.pub_a, 2)
+        tx3 = self._add_tx(self.pub_a, 3)
+        self.state.remove_transactions({tx1.tx_id, tx3.tx_id})
+        remaining = self.state.get_sender_nonces(self.pub_a)
+        self.assertEqual(remaining, [2])
+
+    def test_remove_transactions_empty_set(self):
+        self._add_tx(self.pub_a, 1)
+        self._add_tx(self.pub_a, 2)
+        self.state.remove_transactions(set())
+        self.assertEqual(len(self.state.get_sender_nonces(self.pub_a)), 2)
+
+    def test_remove_transactions_nonexistent_ids(self):
+        self._add_tx(self.pub_a, 1)
+        self.state.remove_transactions({"nonexistent_id"})
+        self.assertEqual(len(self.state.get_sender_nonces(self.pub_a)), 1)
+
+    def test_remove_transactions_handles_duplicates(self):
+        """If the same tx_id appears twice in the pool, both are removed."""
+        tx = self._add_tx(self.pub_a, 1)
+        # Add the same tx again (duplicate submission)
+        self.state.add_transaction(tx)
+        self.assertEqual(self.state.pool_size(), 2)
+        self.state.remove_transactions({tx.tx_id})
+        self.assertEqual(self.state.pool_size(), 0)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Multi-transaction drain (sorting + gaps)
+# ---------------------------------------------------------------------------
+
+
+class TestMultiTransactionDrain(unittest.TestCase):
+    """Tests for drain_pool_validated with sorting and gap handling."""
+
+    def setUp(self):
+        self.uni_priv, self.uni_pub, _ = make_keypair()
+        self.alice_priv, self.alice_pub, _ = make_keypair()
+        self.bob_priv, self.bob_pub, _ = make_keypair()
+
+    def _make_redis_mock(self, nonces: dict[str, int] | None = None,
+                         balances: dict[str, int] | None = None):
+        """Build a Redis mock that returns nonces and balances by pubkey."""
+        redis_mock = MagicMock()
+
+        def _get(key: str):
+            if nonces and key.startswith("nonce:"):
+                pubkey = key[len("nonce:"):]
+                val = nonces.get(pubkey)
+                return str(val) if val is not None else None
+            if balances and key.startswith("balance:"):
+                pubkey = key[len("balance:"):]
+                val = balances.get(pubkey, 0)
+                return str(val)
+            return None
+
+        redis_mock.get.side_effect = _get
+        return redis_mock
+
+    def test_two_txs_same_sender_in_order(self):
+        """Two txs with nonces 1 and 2, current nonce=1 → both accepted."""
+        state = NCTState()
+        redis_mock = self._make_redis_mock(nonces={self.uni_pub: 1})
+
+        tx1 = _make_earn_tx(self.alice_pub, self.uni_priv, self.uni_pub,
+                            amount=1, nonce=1)
+        tx2 = _make_earn_tx(self.bob_pub, self.uni_priv, self.uni_pub,
+                            amount=2, nonce=2)
+        state.add_transaction(tx1)
+        state.add_transaction(tx2)
+
+        result = drain_pool_validated(state, redis_mock)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0].nonce, 1)
+        self.assertEqual(result[1].nonce, 2)
+
+    def test_two_txs_same_sender_out_of_order(self):
+        """Pool has [nonce=2, nonce=1] — sorting fixes order, both accepted."""
+        state = NCTState()
+        redis_mock = self._make_redis_mock(nonces={self.uni_pub: 1})
+
+        tx2 = _make_earn_tx(self.bob_pub, self.uni_priv, self.uni_pub,
+                            amount=2, nonce=2)
+        tx1 = _make_earn_tx(self.alice_pub, self.uni_priv, self.uni_pub,
+                            amount=1, nonce=1)
+        state.add_transaction(tx2)  # nonce=2 arrives first
+        state.add_transaction(tx1)  # nonce=1 arrives second
+
+        result = drain_pool_validated(state, redis_mock)
+        self.assertEqual(len(result), 2,
+                         "Both txs should be accepted after sorting by nonce")
+        self.assertEqual(result[0].nonce, 1)
+        self.assertEqual(result[1].nonce, 2)
+
+    def test_gap_tx_stays_in_pool(self):
+        """tx(nonce=2) with current=1 and no tx(nonce=1) → stays in pool."""
+        state = NCTState()
+        redis_mock = self._make_redis_mock(nonces={self.uni_pub: 1})
+
+        tx2 = _make_earn_tx(self.alice_pub, self.uni_priv, self.uni_pub,
+                            amount=1, nonce=2)
+        state.add_transaction(tx2)
+
+        result = drain_pool_validated(state, redis_mock)
+        self.assertEqual(result, [], "No valid txs — gap tx should stay in pool")
+        self.assertEqual(state.pool_size(), 1,
+                         "Gap tx must remain in the pool")
+        self.assertEqual(state.get_sender_nonces(self.uni_pub), [2])
+
+    def test_gap_filled_later(self):
+        """First drain: tx(nonce=2) → gap. Add tx(nonce=1). Second drain: both."""
+        state = NCTState()
+        redis_mock = self._make_redis_mock(nonces={self.uni_pub: 1})
+
+        tx2 = _make_earn_tx(self.alice_pub, self.uni_priv, self.uni_pub,
+                            amount=2, nonce=2)
+        state.add_transaction(tx2)
+
+        # First drain — only gap
+        result1 = drain_pool_validated(state, redis_mock)
+        self.assertEqual(result1, [])
+        self.assertEqual(state.pool_size(), 1)
+
+        # Fill the gap
+        tx1 = _make_earn_tx(self.alice_pub, self.uni_priv, self.uni_pub,
+                            amount=1, nonce=1)
+        state.add_transaction(tx1)
+
+        # Second drain — both accepted
+        result2 = drain_pool_validated(state, redis_mock)
+        self.assertEqual(len(result2), 2)
+        self.assertEqual(state.pool_size(), 0)
+
+    def test_replay_nonce_less_than_current(self):
+        """tx(nonce=1) with current=3 → discarded as replay."""
+        state = NCTState()
+        redis_mock = self._make_redis_mock(nonces={self.uni_pub: 3})
+
+        tx = _make_earn_tx(self.alice_pub, self.uni_priv, self.uni_pub,
+                           amount=1, nonce=1)
+        state.add_transaction(tx)
+
+        result = drain_pool_validated(state, redis_mock)
+        self.assertEqual(result, [], "Replay tx must be discarded")
+        self.assertEqual(state.pool_size(), 0,
+                         "Discarded tx must be removed from pool")
+
+    def test_duplicate_nonce_same_sender(self):
+        """Two txs with same nonce from same sender → first accepted, second discarded."""
+        state = NCTState()
+        redis_mock = self._make_redis_mock(nonces={self.uni_pub: 1})
+
+        tx1 = _make_earn_tx(self.alice_pub, self.uni_priv, self.uni_pub,
+                            amount=1, nonce=1, concept="A")
+        tx2 = _make_earn_tx(self.bob_pub, self.uni_priv, self.uni_pub,
+                            amount=2, nonce=1, concept="B")
+        state.add_transaction(tx1)
+        state.add_transaction(tx2)
+
+        result = drain_pool_validated(state, redis_mock)
+        self.assertEqual(len(result), 1,
+                         "Only one tx per nonce per sender should be accepted")
+        self.assertEqual(result[0].concept, "A",
+                         "First tx in sorted order should win")
+
+    def test_mixed_senders_independent_nonces(self):
+        """Sender A nonces [1,2], sender B nonce [5] — independent overlays."""
+        state = NCTState()
+        redis_mock = self._make_redis_mock(
+            nonces={self.uni_pub: 1, self.alice_pub: 5},
+            balances={self.alice_pub: 10},  # alice needs balance for SPEND
+        )
+
+        # Sender A (uni): nonces 1 and 2
+        tx_a1 = _make_earn_tx(self.bob_pub, self.uni_priv, self.uni_pub,
+                              amount=1, nonce=1)
+        tx_a2 = _make_earn_tx(self.bob_pub, self.uni_priv, self.uni_pub,
+                              amount=2, nonce=2)
+        # Sender B (alice): nonce 5
+        tx_b = _make_spend_tx(self.alice_priv, self.alice_pub, self.bob_pub,
+                              amount=1, nonce=5)
+
+        state.add_transaction(tx_a1)
+        state.add_transaction(tx_b)
+        state.add_transaction(tx_a2)
+
+        result = drain_pool_validated(state, redis_mock)
+        self.assertEqual(len(result), 3,
+                         "All three txs have correct nonces for their senders")
+
+    def test_spend_balance_overlay_with_ordered_nonces(self):
+        """Sender with balance=5 sends two SPEND of 3 each → second fails."""
+        state = NCTState()
+        redis_mock = self._make_redis_mock(
+            nonces={self.alice_pub: 0},
+            balances={self.alice_pub: 5},
+        )
+
+        tx1 = _make_spend_tx(self.alice_priv, self.alice_pub, self.bob_pub,
+                             amount=3, nonce=0, concept="first")
+        tx2 = _make_spend_tx(self.alice_priv, self.alice_pub, self.bob_pub,
+                             amount=3, nonce=1, concept="second")
+        state.add_transaction(tx1)
+        state.add_transaction(tx2)
+
+        result = drain_pool_validated(state, redis_mock)
+        self.assertEqual(len(result), 1,
+                         "Only first SPEND should pass (balance 5, spent 3+3 > 5)")
+        self.assertEqual(result[0].concept, "first")
+
+    def test_discarded_recorded_in_redis(self):
+        """Discarded transactions should be added to discarded set in Redis."""
+        state = NCTState()
+        redis_mock = self._make_redis_mock(nonces={self.uni_pub: 3})
+
+        tx = _make_earn_tx(self.alice_pub, self.uni_priv, self.uni_pub,
+                           amount=1, nonce=1)  # replay
+        state.add_transaction(tx)
+
+        drain_pool_validated(state, redis_mock)
+        # add_discarded_tx calls sadd on Redis
+        redis_mock.sadd.assert_called()
+
+    def test_trim_pending_called_with_correct_count(self):
+        """trim_pending_txs should count valid + discarded, not gap."""
+        state = NCTState()
+        redis_mock = self._make_redis_mock(nonces={self.uni_pub: 1})
+
+        tx_valid = _make_earn_tx(self.alice_pub, self.uni_priv, self.uni_pub,
+                                 amount=1, nonce=1)
+        tx_gap = _make_earn_tx(self.bob_pub, self.uni_priv, self.uni_pub,
+                               amount=2, nonce=3)
+        state.add_transaction(tx_valid)
+        state.add_transaction(tx_gap)
+
+        drain_pool_validated(state, redis_mock)
+        # trim_pending_txs calls ltrim with count
+        # valid=1, discarded=0, gap=1 → drained_count = 1
+        redis_mock.ltrim.assert_called_once()
+        call_args = redis_mock.ltrim.call_args[0]
+        self.assertEqual(call_args[1], 1,
+                         "Should trim exactly 1 (valid + discarded), not the gap")
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Accumulate with gap-aware retry
+# ---------------------------------------------------------------------------
+
+
+class TestAccumulateTransactionsGap(unittest.TestCase):
+    """Tests for accumulate_transactions handling of gap-only pools."""
+
+    def setUp(self):
+        self.uni_priv, self.uni_pub, _ = make_keypair()
+        self.alice_priv, self.alice_pub, _ = make_keypair()
+
+    def test_returns_when_valid_txs_exist(self):
+        """Normal path: pool has valid txs → returns them immediately."""
+        state = NCTState()
+        config = NCTConfig(block_size=1, block_timeout=30)
+        redis_mock = MagicMock()
+        redis_mock.get.return_value = None  # nonce=0
+
+        tx = _make_earn_tx(self.alice_pub, self.uni_priv, self.uni_pub,
+                           amount=1, nonce=0)
+        state.add_transaction(tx)
+
+        txs = accumulate_transactions(state, redis_mock, config)
+        self.assertEqual(len(txs), 1)
+
+    def test_returns_empty_on_shutdown_during_gap_wait(self):
+        """Shutdown while waiting for gap-fill → returns []."""
+        state = NCTState()
+        config = NCTConfig(block_size=1, block_timeout=0.1)
+        redis_mock = MagicMock()
+        redis_mock.get.return_value = "5"  # nonce=5
+
+        tx = _make_earn_tx(self.alice_pub, self.uni_priv, self.uni_pub,
+                           amount=1, nonce=6)  # gap — needs nonce=5 first
+        state.add_transaction(tx)
+
+        import threading
+        def _shutdown():
+            import time
+            time.sleep(0.3)
+            state.shutdown.set()
+
+        t = threading.Thread(target=_shutdown, daemon=True)
+        t.start()
+
+        txs = accumulate_transactions(state, redis_mock, config)
+        self.assertEqual(txs, [])
+
+    def test_eventually_mines_when_gap_filled(self):
+        """Gap tx stays, then fill-tx arrives → both mined."""
+        state = NCTState()
+        config = NCTConfig(block_size=1, block_timeout=0.1)
+        redis_mock = MagicMock()
+        redis_mock.get.return_value = "0"  # nonce=0
+
+        # Add gap tx first
+        tx_gap = _make_earn_tx(self.alice_pub, self.uni_priv, self.uni_pub,
+                               amount=2, nonce=1)
+        state.add_transaction(tx_gap)
+
+        import threading
+        result_container: list[int] = []
+
+        def _fill_gap():
+            import time
+            time.sleep(0.2)
+            tx_fill = _make_earn_tx(self.alice_pub, self.uni_priv, self.uni_pub,
+                                    amount=1, nonce=0)
+            state.add_transaction(tx_fill)
+
+        t = threading.Thread(target=_fill_gap, daemon=True)
+        t.start()
+
+        txs = accumulate_transactions(state, redis_mock, config)
+        # Should eventually get both txs once the gap is filled
+        self.assertEqual(len(txs), 2)
+        self.assertEqual({tx.nonce for tx in txs}, {0, 1})
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — POST nonce relaxed validation
+# ---------------------------------------------------------------------------
+
+
+class TestPostNonceRelaxed(unittest.TestCase):
+    """Tests for the relaxed POST /transaction nonce check.
+
+    Uses ``unittest.mock.patch`` to bypass Ed25519 signature verification
+    so the tests focus purely on nonce validation logic.
+    """
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+
+        self.TestClient = TestClient
+        self.uni_priv, self.uni_pub, _ = make_keypair()
+        self.alice_priv, self.alice_pub, _ = make_keypair()
+
+    def _build_app(self, redis_nonce: int = 0,
+                   max_nonce_window: int = 100) -> TestClient:
+        """Build an app with the given Redis nonce and window.
+
+        Uses ``100000/minute`` rate limit to avoid cross-test contamination
+        from the shared module-level Limiter singleton.  Audit M5.
+        """
+        from nct.nct import _limiter, create_health_app
+        from nct.state import NCTConfig, NCTState
+
+        # Reset shared limiter storage so previous tests don't exhaust
+        # the rate budget for this test (audit M5).
+        _limiter.reset()
+
+        state = NCTState()
+        redis_mock = MagicMock()
+        # get() returns nonce for any key
+        redis_mock.get.return_value = str(redis_nonce).encode()
+        redis_mock.llen.return_value = 1
+
+        config = NCTConfig(rate_limit="100000/minute",
+                           max_nonce_window=max_nonce_window)
+        config.authority_pubkey = self.uni_pub
+
+        return create_health_app(state, redis_mock, config)
+
+    def _make_tx_body(self, sender_pub: str, receiver_pub: str,
+                      nonce: int) -> dict:
+        return {
+            "sender_pubkey": sender_pub,
+            "receiver_pubkey": receiver_pub,
+            "amount": 1,
+            "tx_type": "EARN",
+            "concept": "test",
+            "signature": "a" * 128,
+            "nonce": nonce,
+        }
+
+    @patch("shared.crypto.verify", return_value=True)
+    def test_post_accepts_nonce_equal_to_current(self, _mock_verify):
+        app = self._build_app(redis_nonce=3)
+        with self.TestClient(app) as tc:
+            tx = self._make_tx_body(self.uni_pub, self.alice_pub, nonce=3)
+            resp = tc.post("/transaction", json=tx)
+            self.assertNotEqual(resp.status_code, 400,
+                                f"nonce=3 should be accepted when current=3, "
+                                f"got {resp.status_code}: {resp.json()}")
+
+    @patch("shared.crypto.verify", return_value=True)
+    def test_post_accepts_nonce_greater_than_current(self, _mock_verify):
+        app = self._build_app(redis_nonce=3)
+        with self.TestClient(app) as tc:
+            tx = self._make_tx_body(self.uni_pub, self.alice_pub, nonce=5)
+            resp = tc.post("/transaction", json=tx)
+            self.assertNotEqual(resp.status_code, 400,
+                                f"nonce=5 should be accepted when current=3, "
+                                f"got {resp.status_code}: {resp.json()}")
+
+    @patch("shared.crypto.verify", return_value=True)
+    def test_post_rejects_nonce_less_than_current(self, _mock_verify):
+        app = self._build_app(redis_nonce=3)
+        with self.TestClient(app) as tc:
+            tx = self._make_tx_body(self.uni_pub, self.alice_pub, nonce=2)
+            resp = tc.post("/transaction", json=tx)
+            self.assertEqual(resp.status_code, 400)
+            self.assertIn("already consumed", resp.json()["error"].lower())
+
+    @patch("shared.crypto.verify", return_value=True)
+    def test_post_rejects_nonce_beyond_window(self, _mock_verify):
+        app = self._build_app(redis_nonce=3, max_nonce_window=10)
+        with self.TestClient(app) as tc:
+            tx = self._make_tx_body(self.uni_pub, self.alice_pub, nonce=20)
+            resp = tc.post("/transaction", json=tx)
+            self.assertEqual(resp.status_code, 400)
+            self.assertIn("too far ahead", resp.json()["error"].lower())
+
+    @patch("shared.crypto.verify", return_value=True)
+    def test_post_nonce_at_window_boundary(self, _mock_verify):
+        app = self._build_app(redis_nonce=3, max_nonce_window=100)
+        with self.TestClient(app) as tc:
+            # current=3, window=100 → max accepted nonce = 103
+            tx = self._make_tx_body(self.uni_pub, self.alice_pub, nonce=103)
+            resp = tc.post("/transaction", json=tx)
+            self.assertNotEqual(resp.status_code, 400,
+                                f"nonce=103 should be at boundary with window=100, "
+                                f"got {resp.status_code}: {resp.json()}")
+
+    @patch("shared.crypto.verify", return_value=True)
+    def test_post_nonce_just_beyond_window(self, _mock_verify):
+        app = self._build_app(redis_nonce=3, max_nonce_window=100)
+        with self.TestClient(app) as tc:
+            tx = self._make_tx_body(self.uni_pub, self.alice_pub, nonce=104)
+            resp = tc.post("/transaction", json=tx)
+            self.assertEqual(resp.status_code, 400)
+            self.assertIn("too far ahead", resp.json()["error"].lower())
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — GET /account/{pubkey} with pending_nonce
+# ---------------------------------------------------------------------------
+
+
+class TestAccountPendingNonce(unittest.TestCase):
+    """Tests for pending_nonce computation in GET /account/{pubkey}."""
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+
+        self.TestClient = TestClient
+        self.uni_priv, self.uni_pub, _ = make_keypair()
+        self.alice_priv, self.alice_pub, _ = make_keypair()
+
+    def _build_app(self, state: NCTState, redis_nonce: int = 0,
+                   redis_balance: int = 0) -> TestClient:
+        from nct.nct import create_health_app
+        from nct.state import NCTConfig
+
+        redis_mock = MagicMock()
+        redis_mock.llen.return_value = 1  # chain has genesis
+
+        def _get(key: str):
+            if key.startswith("nonce:"):
+                return str(redis_nonce).encode()
+            if key.startswith("balance:"):
+                return str(redis_balance).encode()
+            return None
+
+        redis_mock.get.side_effect = _get
+        redis_mock.smembers.return_value = set()
+
+        config = NCTConfig(rate_limit="1000/minute")
+        config.authority_pubkey = self.uni_pub
+
+        return create_health_app(state, redis_mock, config)
+
+    def _make_tx(self, sender_pub: str, nonce: int) -> Transaction:
+        tx = Transaction(
+            sender_pubkey=sender_pub,
+            receiver_pubkey="a" * 64,
+            amount=1,
+            tx_type="EARN",
+            concept="test",
+            nonce=nonce,
+        )
+        tx.signature = "a" * 128
+        return tx
+
+    def test_pending_nonce_equals_confirmed_when_no_pending(self):
+        state = NCTState()
+        app = self._build_app(state, redis_nonce=3)
+        with self.TestClient(app) as tc:
+            resp = tc.get(f"/account/{self.alice_pub}")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["nonce"], 3)
+        self.assertEqual(data["pending_nonce"], 3)
+
+    def test_pending_nonce_advances_with_contiguous_txs(self):
+        state = NCTState()
+        state.add_transaction(self._make_tx(self.alice_pub, nonce=3))
+        state.add_transaction(self._make_tx(self.alice_pub, nonce=4))
+        app = self._build_app(state, redis_nonce=3)
+        with self.TestClient(app) as tc:
+            resp = tc.get(f"/account/{self.alice_pub}")
+        data = resp.json()
+        self.assertEqual(data["nonce"], 3)
+        self.assertEqual(data["pending_nonce"], 5,
+                         "Should advance past contiguous [3,4] → 5")
+
+    def test_pending_nonce_shows_gap(self):
+        state = NCTState()
+        state.add_transaction(self._make_tx(self.alice_pub, nonce=3))
+        state.add_transaction(self._make_tx(self.alice_pub, nonce=5))
+        app = self._build_app(state, redis_nonce=3)
+        with self.TestClient(app) as tc:
+            resp = tc.get(f"/account/{self.alice_pub}")
+        data = resp.json()
+        self.assertEqual(data["nonce"], 3)
+        self.assertEqual(data["pending_nonce"], 4,
+                         "Should point to gap at nonce=4")
+
+    def test_pending_nonce_ignores_replayed_nonces(self):
+        """Nonces below confirmed should be ignored in pending_nonce."""
+        state = NCTState()
+        state.add_transaction(self._make_tx(self.alice_pub, nonce=1))  # stale
+        state.add_transaction(self._make_tx(self.alice_pub, nonce=5))
+        app = self._build_app(state, redis_nonce=5)
+        with self.TestClient(app) as tc:
+            resp = tc.get(f"/account/{self.alice_pub}")
+        data = resp.json()
+        self.assertEqual(data["nonce"], 5)
+        self.assertEqual(data["pending_nonce"], 6,
+                         "Should ignore stale nonce=1 and use 5")
+
+    def test_pending_nonce_when_all_future(self):
+        """All pool nonces > confirmed → pending_nonce = confirmed (gap at start)."""
+        state = NCTState()
+        state.add_transaction(self._make_tx(self.alice_pub, nonce=5))
+        state.add_transaction(self._make_tx(self.alice_pub, nonce=6))
+        app = self._build_app(state, redis_nonce=3)
+        with self.TestClient(app) as tc:
+            resp = tc.get(f"/account/{self.alice_pub}")
+        data = resp.json()
+        self.assertEqual(data["nonce"], 3)
+        self.assertEqual(data["pending_nonce"], 3,
+                         "Gap from the start → pending = confirmed")
 
 
 if __name__ == "__main__":
