@@ -1,13 +1,13 @@
-# Ingress — HTTPS con certificado Let's Encrypt vía cert-manager
+# Ingress — HTTPS con wildcard TLS (certbot / Let's Encrypt)
 # Namespace: apps — único punto de entrada HTTPS desde internet
 #
-# Dominios:
-#   edutokens.xyz  → /  → apps/frontend:80  (cuando se despliegue el frontend)
+# El Secret TLS (edutokens-tls) contiene el wildcard *.edutokens.xyz
+# generado con certbot (DNS-01 challenge vía Namecheap).
+# Cubre edutokens.xyz, nct.edutokens.xyz y cualquier subdominio futuro.
 #
-# NCT y RabbitMQ Management NO se exponen vía Ingress.
-# Se acceden con kubectl port-forward:
-#   kubectl -n blockchain port-forward svc/nct 8080:8080
-#   kubectl -n infra port-forward svc/rabbitmq 15672:15672
+# Dominios:
+#   edutokens.xyz      → /  → apps/frontend:80
+#   nct.edutokens.xyz  → /  → apps/nct-api:8080
 #
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -17,7 +17,6 @@ metadata:
   labels:
     app: edutokens
   annotations:
-    cert-manager.io/cluster-issuer: "letsencrypt-prod"
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
 spec:

@@ -1,6 +1,8 @@
-# ClusterIssuer — Let's Encrypt Production
-# Emite certificados TLS automáticamente vía HTTP-01 challenge.
-# Requiere cert-manager y nginx-ingress instalados en el cluster.
+# ── Eliminado ────────────────────────────────────────────────────
+# cert-manager fue reemplazado por certbot con wildcard DNS-01.
+# El certificado *.edutokens.xyz se gestiona fuera del cluster.
+# Ver README.md actualizado para instrucciones de TLS.
+# ───────────────────────────────────────────────────────────────────
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:

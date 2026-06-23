@@ -24,7 +24,7 @@ Guía paso a paso para desplegar la blockchain EduTokens en Google Kubernetes En
 │  └────────────────────────────────────────────────────────────────┘   │
 │                                                                       │
 │  ┌── namespace: apps ────────────────────────────────────────────┐   │
-│  │  nginx-ingress + cert-manager (Let's Encrypt production)        │   │
+│  │  nginx-ingress + certbot wildcard TLS (*.edutokens.xyz)          │   │
 │  │  Dominio: edutokens.xyz                                         │   │
 │  └────────────────────────────────────────────────────────────────┘   │
 │                                                                       │
@@ -95,14 +95,32 @@ gcloud container clusters get-credentials edutokens-cluster \
 
 ---
 
-## 3. Instalar cert-manager e ingress-nginx
+## 3. Instalar ingress-nginx + Configurar TLS
 
 ```bash
-# cert-manager para certificados TLS automáticos (Let's Encrypt)
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.5/cert-manager.yaml
-
 # nginx-ingress como controlador de entrada
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.10.1/deploy/static/provider/cloud/deploy.yaml
+```
+
+### 3.1 Certificado TLS (certbot wildcard DNS-01)
+
+El certificado wildcard `*.edutokens.xyz` se genera con certbot usando DNS-01
+challenge vía Namecheap. Cubre `edutokens.xyz`, `nct.edutokens.xyz` y cualquier
+subdominio futuro **sin necesidad de cert-manager**.
+
+Crear el Secret TLS desde los archivos de certbot:
+
+```bash
+sudo kubectl create secret tls edutokens-tls \
+    --cert=/etc/letsencrypt/live/edutokens.xyz/fullchain.pem \
+    --key=/etc/letsencrypt/live/edutokens.xyz/privkey.pem \
+    -n apps --dry-run=client -o yaml | kubectl apply -f -
+```
+
+⚠️ El certificado expira cada 90 días. Renovar con:
+```bash
+sudo certbot renew
+# Luego repetir el kubectl create secret tls de arriba
 ```
 
 ---
@@ -277,10 +295,9 @@ pilar3/
 │   ├── versions.tf              # Provider versions
 │   └── outputs.tf               # Outputs (IPs, URLs, comandos)
 ├── k8s/                         # Manifiestos Kubernetes (16 YAMLs)
-│   ├── ingress.yaml             # Ingress HTTPS (apps namespace)
+│   ├── ingress.yaml             # Ingress HTTPS (apps namespace, certbot TLS)
 │   ├── network-policies.yaml    # NetworkPolicy (deshabilitado en prod)
-│   ├── cert-manager/
-│   │   └── cluster-issuer.yaml  # Let's Encrypt production
+│   ├── nct-external-service.yaml  # ExternalName: apps → blockchain
 │   ├── apps/
 │   │   └── namespace.yaml
 │   ├── infra/
@@ -324,7 +341,7 @@ pilar3/
 | D7 | Redis StatefulSet con PVC + AOF | Persistencia de la cadena |
 | D8 | Sin NetworkPolicy en producción | Rompieron DNS y cert-manager en testing |
 | D9 | Secretos `.example` + gitignore | Templates versionados, valores nunca commiteados |
-| D10 | cert-manager + nginx-ingress vía kubectl | Sin Helm ni Terraform para componentes K8s |
+| D10 | certbot wildcard DNS-01 (Namecheap) + nginx-ingress | Sin cert-manager, renovación manual cada 90 días |
 | D11 | Let's Encrypt production para Ingress | Un solo certificado wildcard |
 | D12 | Dominios separados: `edutokens.xyz` (HTTPS), `rabbitmq.edutokens.xyz` (AMQPS) | Separación de responsabilidades |
 | D13 | CI/CD con Workload Identity Federation | GitHub Actions → GCP sin credenciales estáticas |
