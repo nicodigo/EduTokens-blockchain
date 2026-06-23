@@ -1,5 +1,4 @@
 # terraform.tfvars — completar los campos marcados con ⚠️
-# Dominio DuckDNS confirmado: edutokens.duckdns.org ✅
 
 project_id         = "edutokens-2026"
 region             = "us-central1"
@@ -16,5 +15,5 @@ gpu_source_ranges  = []
 
 # Free tier quotas — no tocar salvo que necesites ajustar
 node_machine_type  = "e2-standard-2"
-node_count         = 2
+node_count         = 3
 node_disk_size_gb  = 30
