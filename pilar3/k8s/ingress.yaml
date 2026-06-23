@@ -6,8 +6,9 @@
 # Cubre edutokens.xyz, nct.edutokens.xyz y cualquier subdominio futuro.
 #
 # Dominios:
-#   edutokens.xyz      → /  → apps/frontend:80
-#   nct.edutokens.xyz  → /  → apps/nct-api:8080
+#   edutokens.xyz        → /  → apps/frontend:80
+#   nct.edutokens.xyz    → /  → apps/nct-api:8080
+#   grafana.edutokens.xyz → /  → apps/grafana-api:3000
 #
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -25,6 +26,7 @@ spec:
   - hosts:
     - edutokens.xyz
     - nct.edutokens.xyz
+    - grafana.edutokens.xyz
     secretName: edutokens-tls
   rules:
   - host: edutokens.xyz
@@ -47,3 +49,13 @@ spec:
             name: nct-api
             port:
               number: 8080
+  - host: grafana.edutokens.xyz
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: grafana-api
+            port:
+              number: 3000

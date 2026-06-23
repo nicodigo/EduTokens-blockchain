@@ -1,0 +1,19 @@
+# Grafana ExternalName Service — proxy en namespace apps hacia monitoring
+# Permite que el Ingress (apps) referencie a Grafana (monitoring) sin
+# violar la restricción de que Ingress solo rutea a Services en su mismo
+# namespace.
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana-api
+  namespace: apps
+  labels:
+    app: grafana-api
+spec:
+  type: ExternalName
+  externalName: grafana.monitoring.svc.cluster.local
+  ports:
+  - name: http
+    port: 3000
+    targetPort: 3000
+    protocol: TCP

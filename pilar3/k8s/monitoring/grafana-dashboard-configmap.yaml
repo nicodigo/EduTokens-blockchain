@@ -1,0 +1,298 @@
+# Grafana dashboard provider + dashboard JSON
+# Se montan en /etc/grafana/provisioning/dashboards/ y /var/lib/grafana/dashboards/
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: monitoring
+  labels:
+    app: grafana
+data:
+  provider.yaml: |
+    apiVersion: 1
+    providers:
+      - name: default
+        orgId: 1
+        folder: ""
+        type: file
+        disableDeletion: true
+        updateIntervalSeconds: 10
+        allowUiUpdates: false
+        options:
+          path: /var/lib/grafana/dashboards
+          foldersFromFilesStructure: false
+
+  edutokens.json: |
+    {
+      "uid": "edutokens",
+      "title": "EduTokens Blockchain",
+      "tags": ["blockchain", "edutokens"],
+      "timezone": "browser",
+      "refresh": "10s",
+      "schemaVersion": 39,
+      "version": 1,
+      "panels": [
+        {
+          "id": 1,
+          "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+          "title": "Chain Height",
+          "type": "stat",
+          "targets": [{
+            "expr": "nct_chain_height",
+            "refId": "A"
+          }],
+          "options": {
+            "reduceOptions": {"values": false, "calcs": ["lastNotNull"]},
+            "textMode": "value"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "mappings": [],
+              "color": {"mode": "thresholds"}
+            }
+          }
+        },
+        {
+          "id": 2,
+          "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+          "title": "Blocks Mined",
+          "type": "stat",
+          "targets": [{
+            "expr": "nct_blocks_mined_total",
+            "refId": "A"
+          }],
+          "options": {
+            "reduceOptions": {"values": false, "calcs": ["lastNotNull"]},
+            "textMode": "value"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+              "mappings": [],
+              "color": {"mode": "thresholds"}
+            }
+          }
+        },
+        {
+          "id": 3,
+          "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+          "title": "Uptime",
+          "type": "stat",
+          "targets": [{
+            "expr": "nct_uptime_seconds",
+            "refId": "A"
+          }],
+          "options": {
+            "reduceOptions": {"values": false, "calcs": ["lastNotNull"]},
+            "textMode": "value"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "mappings": [],
+              "color": {"mode": "thresholds"}
+            }
+          }
+        },
+        {
+          "id": 4,
+          "gridPos": {"h": 4, "w": 3, "x": 12, "y": 0},
+          "title": "Pending Tx",
+          "type": "stat",
+          "targets": [{
+            "expr": "nct_pending_transactions",
+            "refId": "A"
+          }],
+          "options": {
+            "reduceOptions": {"values": false, "calcs": ["lastNotNull"]},
+            "textMode": "value"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {"mode": "absolute", "steps": [
+                {"color": "green", "value": null},
+                {"color": "orange", "value": 10},
+                {"color": "red", "value": 50}
+              ]},
+              "mappings": [],
+              "color": {"mode": "thresholds"}
+            }
+          }
+        },
+        {
+          "id": 5,
+          "gridPos": {"h": 4, "w": 3, "x": 15, "y": 0},
+          "title": "Active Pools",
+          "type": "stat",
+          "targets": [{
+            "expr": "nct_active_pools",
+            "refId": "A"
+          }],
+          "options": {
+            "reduceOptions": {"values": false, "calcs": ["lastNotNull"]},
+            "textMode": "value"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {"mode": "absolute", "steps": [
+                {"color": "red", "value": null},
+                {"color": "orange", "value": 1},
+                {"color": "green", "value": 2}
+              ]},
+              "mappings": [],
+              "color": {"mode": "thresholds"}
+            }
+          }
+        },
+        {
+          "id": 6,
+          "gridPos": {"h": 4, "w": 3, "x": 18, "y": 0},
+          "title": "Pool Workers",
+          "type": "stat",
+          "targets": [{
+            "expr": "pool_active_workers",
+            "refId": "A"
+          }],
+          "options": {
+            "reduceOptions": {"values": false, "calcs": ["lastNotNull"]},
+            "textMode": "value"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {"mode": "absolute", "steps": [
+                {"color": "red", "value": null},
+                {"color": "green", "value": 1}
+              ]},
+              "mappings": [],
+              "color": {"mode": "thresholds"}
+            }
+          }
+        },
+        {
+          "id": 10,
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+          "title": "Transactions / min",
+          "type": "timeseries",
+          "targets": [
+            {
+              "expr": "rate(nct_transactions_received_total[1m]) * 60",
+              "legendFormat": "Received",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(nct_transactions_rejected_total[1m]) * 60",
+              "legendFormat": "Rejected",
+              "refId": "B"
+            }
+          ],
+          "options": {
+            "legend": {"displayMode": "list", "placement": "bottom"}
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": {"mode": "palette-classic"},
+              "custom": {"lineInterpolation": "smooth", "fillOpacity": 10}
+            },
+            "overrides": [
+              {"matcher": {"id": "byName", "options": "Rejected"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]},
+              {"matcher": {"id": "byName", "options": "Received"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]}
+            ]
+          }
+        },
+        {
+          "id": 11,
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+          "title": "RabbitMQ Queue Messages",
+          "type": "timeseries",
+          "targets": [
+            {
+              "expr": "rabbitmq_queue_messages",
+              "legendFormat": "{{queue}}",
+              "refId": "A"
+            }
+          ],
+          "options": {
+            "legend": {"displayMode": "table", "placement": "right"}
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"lineInterpolation": "smooth", "fillOpacity": 5}
+            }
+          }
+        },
+        {
+          "id": 12,
+          "gridPos": {"h": 6, "w": 8, "x": 0, "y": 12},
+          "title": "Tasks Completed",
+          "type": "stat",
+          "targets": [{
+            "expr": "pool_tasks_completed_total",
+            "refId": "A"
+          }],
+          "options": {
+            "reduceOptions": {"values": false, "calcs": ["lastNotNull"]},
+            "textMode": "value"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+              "mappings": [],
+              "color": {"mode": "thresholds"}
+            }
+          }
+        },
+        {
+          "id": 13,
+          "gridPos": {"h": 6, "w": 8, "x": 8, "y": 12},
+          "title": "RabbitMQ Connections",
+          "type": "stat",
+          "targets": [{
+            "expr": "rabbitmq_connections",
+            "refId": "A"
+          }],
+          "options": {
+            "reduceOptions": {"values": false, "calcs": ["lastNotNull"]},
+            "textMode": "value"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {"mode": "absolute", "steps": [
+                {"color": "red", "value": null},
+                {"color": "green", "value": 1}
+              ]},
+              "mappings": [],
+              "color": {"mode": "thresholds"}
+            }
+          }
+        },
+        {
+          "id": 14,
+          "gridPos": {"h": 6, "w": 8, "x": 16, "y": 12},
+          "title": "Mempool Size",
+          "type": "stat",
+          "targets": [{
+            "expr": "nct_pending_transactions",
+            "refId": "A"
+          }],
+          "options": {
+            "reduceOptions": {"values": false, "calcs": ["lastNotNull"]},
+            "textMode": "value"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {"mode": "absolute", "steps": [
+                {"color": "green", "value": null},
+                {"color": "orange", "value": 5},
+                {"color": "red", "value": 20}
+              ]},
+              "mappings": [],
+              "color": {"mode": "thresholds"}
+            }
+          }
+        }
+      ]
+    }

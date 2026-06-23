@@ -27,32 +27,43 @@ kubectl apply -f "$K8S_DIR/infra/rabbitmq-service.yaml"
 kubectl apply -f "$K8S_DIR/blockchain/nct-service.yaml"
 kubectl apply -f "$K8S_DIR/blockchain/pool-service.yaml"
 
-echo "==> 4/4 StatefulSets + Deployments + Ingress"
+echo "==> 4/5 StatefulSets + Deployments"
 kubectl apply -f "$K8S_DIR/infra/redis-statefulset.yaml"
 kubectl apply -f "$K8S_DIR/infra/rabbitmq-statefulset.yaml"
 kubectl apply -f "$K8S_DIR/blockchain/nct-deployment.yaml"
 kubectl apply -f "$K8S_DIR/blockchain/pool-deployment.yaml"
 
-# NCT ExternalName Service — proxy en apps → nct.blockchain
-# Requiere que el namespace apps ya exista (creado por EduTokens-app/scripts/deploy.sh)
+echo ""
+echo "==> Esperando a que los pods de blockchain estén listos..."
+kubectl -n infra      wait --for=condition=ready pod -l app=redis    --timeout=120s 2>/dev/null || true
+kubectl -n blockchain wait --for=condition=ready pod -l app=nct      --timeout=120s 2>/dev/null || true
+kubectl -n blockchain wait --for=condition=ready pod -l app=pool-a   --timeout=120s 2>/dev/null || true
+kubectl -n infra      wait --for=condition=ready pod -l app=rabbitmq --timeout=300s 2>/dev/null || true
+
+echo "==> 5/5 Ingress + Monitoring"
+# ExternalName Services — proxy en apps → cross-namespace
 kubectl apply -f "$K8S_DIR/nct-external-service.yaml"
+kubectl apply -f "$K8S_DIR/monitoring/grafana-external-service.yaml"
 
 # Ingress — requiere que el namespace apps ya exista
 kubectl apply -f "$K8S_DIR/ingress.yaml"
 
-echo ""
-echo "==> Esperando a que todos los pods estén listos..."
-kubectl -n infra      wait --for=condition=ready pod -l app=redis    --timeout=120s 2>/dev/null || true
-kubectl -n blockchain wait --for=condition=ready pod -l app=nct      --timeout=120s 2>/dev/null || true
-kubectl -n blockchain wait --for=condition=ready pod -l app=pool-a   --timeout=120s 2>/dev/null || true
-# RabbitMQ depende del certificado — puede demorar más
-kubectl -n infra      wait --for=condition=ready pod -l app=rabbitmq --timeout=300s 2>/dev/null || true
+# Observability stack (Prometheus + Grafana)
+kubectl apply -f "$K8S_DIR/monitoring/namespace.yaml"
+kubectl apply -f "$K8S_DIR/monitoring/prometheus-configmap.yaml"
+kubectl apply -f "$K8S_DIR/monitoring/prometheus-deployment.yaml"
+kubectl apply -f "$K8S_DIR/monitoring/grafana-datasource-configmap.yaml"
+kubectl apply -f "$K8S_DIR/monitoring/grafana-dashboard-configmap.yaml"
+kubectl apply -f "$K8S_DIR/monitoring/grafana-deployment.yaml"
+
+kubectl -n monitoring wait --for=condition=ready pod -l app=prometheus --timeout=120s 2>/dev/null || true
+kubectl -n monitoring wait --for=condition=ready pod -l app=grafana    --timeout=120s 2>/dev/null || true
 
 echo ""
 echo "==> Estado final"
 kubectl get pods -n infra
 kubectl get pods -n blockchain
-kubectl get certificate -n apps
+kubectl get pods -n monitoring
 
 echo ""
 echo "✅ Deploy de blockchain completado"
@@ -62,3 +73,14 @@ echo ""
 echo "==> Verificación rápida de endpoints"
 echo "NCT health:"
 kubectl -n blockchain exec deploy/nct -- curl -sf http://localhost:8080/health 2>/dev/null || echo "  ⚠️  NCT aún no responde"
+echo "Prometheus targets:"
+kubectl -n monitoring exec deploy/prometheus -- wget -qO- http://localhost:9090/api/v1/targets 2>/dev/null | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+for t in d.get('data',{}).get('activeTargets',[]):
+    print(f\"  {'✅' if t['health']=='up' else '❌'} {t['labels'].get('job','?')} — {t['scrapeUrl']}\")
+" 2>/dev/null || echo "  ⚠️  Prometheus aún no listo"
+echo ""
+echo "Accesos públicos:"
+echo "  App:       https://edutokens.xyz"
+echo "  NCT API:   https://nct.edutokens.xyz/health"
+echo "  Grafana:   https://grafana.edutokens.xyz (admin / admin)"

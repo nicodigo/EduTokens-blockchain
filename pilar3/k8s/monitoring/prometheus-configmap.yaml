@@ -1,0 +1,42 @@
+# Prometheus scrape configuration
+# Targets: NCT, Pool, RabbitMQ (via internal K8s DNS, sin TLS overhead)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+  labels:
+    app: prometheus
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      evaluation_interval: 30s
+
+    scrape_configs:
+      - job_name: nct
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - nct.blockchain.svc.cluster.local:8080
+            labels:
+              service: nct
+              namespace: blockchain
+
+      - job_name: pool
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - pool-a.blockchain.svc.cluster.local:8090
+            labels:
+              service: pool
+              namespace: blockchain
+
+      - job_name: rabbitmq
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - rabbitmq.infra.svc.cluster.local:15692
+            labels:
+              service: rabbitmq
+              namespace: infra

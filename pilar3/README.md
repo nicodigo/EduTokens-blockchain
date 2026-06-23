@@ -25,7 +25,12 @@ Guía paso a paso para desplegar la blockchain EduTokens en Google Kubernetes En
 │                                                                       │
 │  ┌── namespace: apps ────────────────────────────────────────────┐   │
 │  │  nginx-ingress + certbot wildcard TLS (*.edutokens.xyz)          │   │
-│  │  Dominio: edutokens.xyz                                         │   │
+│  │  edutokens.xyz | nct.edutokens.xyz | grafana.edutokens.xyz      │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                       │
+│  ┌── namespace: monitoring ───────────────────────────────────────┐   │
+│  │  Prometheus (Deployment ×1)    Grafana (Deployment ×1)          │   │
+│  │  Scrape NCT + Pool + RabbitMQ  Dashboard: EduTokens Blockchain  │   │
 │  └────────────────────────────────────────────────────────────────┘   │
 │                                                                       │
 │  ┌── cluster externo (profesor): namespace g-compumundo ─────────┐   │
@@ -178,17 +183,71 @@ gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 ```
 
 **Qué aplica (en orden):**
-1. Namespaces: `infra`, `blockchain`, `apps`
-2. ConfigMaps + Secrets + ServiceAccount + ClusterIssuer
+1. Namespaces: `infra`, `blockchain`, `apps`, `monitoring`
+2. ConfigMaps + Secrets + ServiceAccount
 3. Services (Redis, RabbitMQ, NCT, Pool)
 4. StatefulSets (Redis, RabbitMQ) + Deployments (NCT, Pool)
-5. Ingress (HTTPS con Let's Encrypt production)
+5. Ingress + ExternalName Services + Monitoring (Prometheus + Grafana)
 
 **Verificar que todo esté listo:**
 ```bash
 kubectl get pods -n infra
 kubectl get pods -n blockchain
+kubectl get pods -n monitoring
 ```
+
+---
+
+## 5. Monitoring (Prometheus + Grafana)
+
+El stack de observabilidad se despliega en el namespace `monitoring`. Prometheus scrapea métricas de NCT, Pool y RabbitMQ cada 30s. Grafana visualiza los datos con un dashboard pre-cargado.
+
+### 5.1 Desplegar
+
+Incluido en `deploy-k8s.sh` (fase 5/5). Para deploy manual:
+
+```bash
+kubectl apply -f pilar3/k8s/monitoring/namespace.yaml
+kubectl apply -f pilar3/k8s/monitoring/prometheus-configmap.yaml
+kubectl apply -f pilar3/k8s/monitoring/prometheus-deployment.yaml
+kubectl apply -f pilar3/k8s/monitoring/grafana-datasource-configmap.yaml
+kubectl apply -f pilar3/k8s/monitoring/grafana-dashboard-configmap.yaml
+kubectl apply -f pilar3/k8s/monitoring/grafana-deployment.yaml
+kubectl apply -f pilar3/k8s/monitoring/grafana-external-service.yaml
+```
+
+### 5.2 Verificar
+
+```bash
+# Prometheus targets (deben estar 3/3 UP)
+kubectl -n monitoring port-forward svc/prometheus 9090:9090
+# Abrir http://localhost:9090/targets
+
+# Grafana
+kubectl -n monitoring port-forward svc/grafana 3000:3000
+# Abrir http://localhost:3000 → login admin/admin → dashboard "EduTokens Blockchain"
+```
+
+### 5.3 Acceso público
+
+Grafana está expuesto vía Ingress en `https://grafana.edutokens.xyz` (cubierto por el wildcard TLS). Login: `admin` / `admin`.
+
+### 5.4 Targets scrapeados
+
+| Target | Endpoint | Métricas |
+|---|---|---|
+| NCT | `nct.blockchain:8080/metrics` | `nct_chain_height`, `nct_blocks_mined_total`, `nct_transactions_received_total`, `nct_transactions_rejected_total`, `nct_pending_transactions`, `nct_active_pools`, `nct_uptime_seconds` |
+| Pool | `pool-a.blockchain:8090/metrics` | `pool_tasks_received_total`, `pool_tasks_completed_total`, `pool_active_workers`, `pool_uptime_seconds` |
+| RabbitMQ | `rabbitmq.infra:15692/metrics` | Métricas nativas (`rabbitmq_queue_messages`, `rabbitmq_connections`, etc.) |
+
+### 5.5 Dashboard
+
+El dashboard "EduTokens Blockchain" se carga automáticamente vía ConfigMap provisioning. Muestra:
+
+- **Chain stats**: altura, bloques minados, uptime
+- **Transacciones**: tasa de recepción y rechazo (tx/min), mempool pendiente
+- **Pool**: workers activos, tareas completadas
+- **RabbitMQ**: mensajes en cola, conexiones activas
 
 ---
 
@@ -298,6 +357,11 @@ pilar3/
 │   ├── ingress.yaml             # Ingress HTTPS (apps namespace, certbot TLS)
 │   ├── network-policies.yaml    # NetworkPolicy (deshabilitado en prod)
 │   ├── nct-external-service.yaml  # ExternalName: apps → blockchain
+│   ├── monitoring/                # Observability (Prometheus + Grafana)
+│   │   ├── namespace.yaml
+│   │   ├── prometheus-*.yaml      # Deployment + ConfigMap (scrape config)
+│   │   ├── grafana-*.yaml         # Deployment + ConfigMaps (datasource + dashboard)
+│   │   └── grafana-external-service.yaml  # ExternalName: apps → monitoring
 │   ├── apps/
 │   │   └── namespace.yaml
 │   ├── infra/
@@ -346,3 +410,4 @@ pilar3/
 | D12 | Dominios separados: `edutokens.xyz` (HTTPS), `rabbitmq.edutokens.xyz` (AMQPS) | Separación de responsabilidades |
 | D13 | CI/CD con Workload Identity Federation | GitHub Actions → GCP sin credenciales estáticas |
 | D14 | GitHub Actions cache para Docker builds | Rebuilds incrementales, solo cambia lo modificado |
+| D15 | Prometheus + Grafana en namespace `monitoring` | Observabilidad sin modificar servicios existentes. emptyDir (demo), scrape 30s interno sin TLS overhead. Grafana expuesto vía Ingress con wildcard cert |
