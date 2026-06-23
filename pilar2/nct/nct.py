@@ -804,13 +804,13 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
                 result.append(blk.to_dict())
         return result
 
-    @app.get("/metrics", response_class=PlainTextResponse)
-    def metrics() -> PlainTextResponse:
+    @app.get("/metrics")
+    def metrics():
         """Prometheus text format metrics endpoint."""
-        from fastapi.responses import Response as PlainTextResponse
+        from fastapi.responses import Response
 
         uptime = time.time() - state.start_time
-        return PlainTextResponse(
+        return Response(
             content=(
                 "# HELP nct_uptime_seconds Uptime of the NCT process\n"
                 "# TYPE nct_uptime_seconds gauge\n"
