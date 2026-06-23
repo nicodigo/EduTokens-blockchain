@@ -87,6 +87,7 @@ class StressReport:
     blocks_mined: int
     mining_time_sec: float
     tx_per_minute: float
+    converged: bool = False  # early exit: blocks hold >BLOCK_SIZE tx
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +135,8 @@ class StressTest:
 
     def run(self, count: int = 50, parallel: int = 10) -> StressReport:
         from httpx import Client
+
+        converged = False  # early exit via convergence
 
         print(f"⚡ Stress test — NCT @ {self.base_url}")
         print(f"   Transactions: {count}, parallel workers: {parallel}")
@@ -224,8 +227,14 @@ class StressTest:
 
         # Wait for blocks to be mined
         print(f"\n⛏️  Waiting for blocks to be mined...")
-        blocks_needed = (len(accepted) + 4) // 5  # BLOCK_SIZE=5
+        blocks_needed = (len(accepted) + 4) // 5  # BLOCK_SIZE=5 (minimum)
         deadline = time.time() + max(300, blocks_needed * 60)
+        # Convergence: if pending=0 and chain stable for this many checks,
+        # all txs are mined (even if fewer blocks than expected due to
+        # blocks holding more than BLOCK_SIZE transactions).
+        stable_checks = 0
+        last_chain = chain_initial
+        convergence_threshold = 4  # 4 checks × 5s = 20s of stability
 
         chain_final = chain_initial
         while time.time() < deadline:
@@ -242,6 +251,18 @@ class StressTest:
             sys.stdout.flush()
             if chain_final >= chain_initial + blocks_needed and pending == 0:
                 break
+            # Early exit: all txs mined (blocks can hold >BLOCK_SIZE txs)
+            if pending == 0 and chain_final == last_chain:
+                stable_checks += 1
+                if stable_checks >= convergence_threshold:
+                    converged = True
+                    print(f"\n   All transactions mined "
+                          f"({chain_final - chain_initial} blocks, "
+                          f"fewer than expected — blocks can hold >BLOCK_SIZE)")
+                    break
+            else:
+                last_chain = chain_final
+                stable_checks = 0
 
         mining_time = time.perf_counter() - t_start
         blocks_mined = chain_final - chain_initial
@@ -265,6 +286,7 @@ class StressTest:
             blocks_mined=blocks_mined,
             mining_time_sec=mining_time,
             tx_per_minute=tx_per_min,
+            converged=converged,
         )
 
 
@@ -320,11 +342,11 @@ def main() -> None:
             print(f"⚠️  {report.rejected} transactions rejected — "
                   f"check rate limits and nonces")
 
-        if report.blocks_mined >= report.accepted // 5:
+        if report.converged or report.blocks_mined >= report.accepted // 5:
             print("✅ All expected blocks mined!")
         else:
             print(f"⚠️  Only {report.blocks_mined} blocks mined — "
-                  f"some transactions may be stuck")
+                  f"some transactions may be stuck (timeout)")
     finally:
         if pf_proc:
             pf_proc.terminate()

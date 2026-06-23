@@ -1,29 +1,25 @@
-# Worker GPU Deployment — para cluster del profesor con GPUs NVIDIA
-# Requiere: nvidia-device-plugin instalado en el cluster
+# Worker CPU Deployment — para cluster del profesor (sin GPU)
+# Compañero del worker-gpu: mismos secretos, mismo pool, miner en CPU
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: worker-gpu
+  name: worker-cpu
   namespace: g-compumundo
   labels:
-    app: worker-gpu
+    app: worker-cpu
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: worker-gpu
+      app: worker-cpu
   template:
     metadata:
       labels:
-        app: worker-gpu
+        app: worker-cpu
     spec:
-      tolerations:
-      - key: nvidia.com/gpu
-        operator: Exists
-        effect: NoSchedule
       containers:
-      - name: worker-gpu
-        image: us-central1-docker.pkg.dev/edutokens-2026/edutokens-repo/worker-gpu:latest
+      - name: worker-cpu
+        image: us-central1-docker.pkg.dev/edutokens-2026/edutokens-repo/worker-cpu:latest
         imagePullPolicy: IfNotPresent
         ports:
         - name: health
@@ -37,7 +33,7 @@ spec:
         - name: HEALTH_PORT
           value: "8081"
         - name: MINER_BINARY
-          value: "/app/md5_range"
+          value: "python /app/miner/cpu_miner.py"
         - name: LOG_FILE
           value: ""
         envFrom:
@@ -45,9 +41,11 @@ spec:
             name: worker-gpu-secret
         resources:
           requests:
-            nvidia.com/gpu: 1
+            cpu: 250m
+            memory: 256Mi
           limits:
-            nvidia.com/gpu: 1
+            cpu: 500m
+            memory: 512Mi
         livenessProbe:
           httpGet:
             path: /health
