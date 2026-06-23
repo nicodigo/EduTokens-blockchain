@@ -1,0 +1,21 @@
+# NCT ExternalName Service — proxy en namespace apps hacia nct.blockchain
+# Permite que el Ingress (apps) referencie al NCT (blockchain) sin
+# violar la restricción de Kubernetes de que Ingress solo rutea a
+# Services en su mismo namespace.
+#
+# Usa DNS interno de K8s: nct.blockchain.svc.cluster.local
+apiVersion: v1
+kind: Service
+metadata:
+  name: nct-api
+  namespace: apps
+  labels:
+    app: nct-api
+spec:
+  type: ExternalName
+  externalName: nct.blockchain.svc.cluster.local
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP

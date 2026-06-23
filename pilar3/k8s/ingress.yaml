@@ -25,6 +25,7 @@ spec:
   tls:
   - hosts:
     - edutokens.xyz
+    - nct.edutokens.xyz
     secretName: edutokens-tls
   rules:
   - host: edutokens.xyz
@@ -37,14 +38,13 @@ spec:
             name: frontend
             port:
               number: 80
-  # --- Dominios futuros (descomentar cuando existan los backends) ---
-  # - host: api.edutokens.xyz
-  #   http:
-  #     paths:
-  #     - path: /
-  #       pathType: Prefix
-  #       backend:
-  #         service:
-  #           name: nct-api
-  #           port:
-  #             number: 8080
+  - host: nct.edutokens.xyz
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nct-api
+            port:
+              number: 8080

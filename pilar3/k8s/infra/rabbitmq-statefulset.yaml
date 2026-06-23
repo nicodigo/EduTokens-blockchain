@@ -59,6 +59,9 @@ spec:
         - name: management
           containerPort: 15672
           protocol: TCP
+        - name: metrics
+          containerPort: 15692
+          protocol: TCP
         resources:
           requests:
             memory: "256Mi"

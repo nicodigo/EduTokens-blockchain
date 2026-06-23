@@ -34,7 +34,11 @@ kubectl apply -f "$K8S_DIR/infra/rabbitmq-statefulset.yaml"
 kubectl apply -f "$K8S_DIR/blockchain/nct-deployment.yaml"
 kubectl apply -f "$K8S_DIR/blockchain/pool-deployment.yaml"
 
-# Ingress — requiere que el namespace apps ya exista (creado por EduTokens-app/scripts/deploy.sh)
+# NCT ExternalName Service — proxy en apps → nct.blockchain
+# Requiere que el namespace apps ya exista (creado por EduTokens-app/scripts/deploy.sh)
+kubectl apply -f "$K8S_DIR/nct-external-service.yaml"
+
+# Ingress — requiere que el namespace apps ya exista
 kubectl apply -f "$K8S_DIR/ingress.yaml"
 
 echo ""

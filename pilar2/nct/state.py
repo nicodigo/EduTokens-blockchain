@@ -73,6 +73,12 @@ class NCTState:
         #    handle_result call.  Acceptable for this PoC.) --
         self.chain_height: int = 0
 
+        # -- prometheus counters (best-effort, no lock — GIL makes +=1 atomic) --
+        self.start_time: float = time.time()
+        self.blocks_mined_total: int = 0
+        self.transactions_received_total: int = 0
+        self.transactions_rejected_total: int = 0
+
     # ------------------------------------------------------------------
     # Current mining job
     # ------------------------------------------------------------------

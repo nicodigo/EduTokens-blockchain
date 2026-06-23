@@ -277,6 +277,7 @@ def handle_result(
     # ---- Persist atomically (audit H3, M4) ----
     save_block_atomic(redis_client, current_block)
     state.chain_height = current_block.index + 1
+    state.blocks_mined_total += 1
 
     # ---- Broadcast abort / signal block loop ----
     broadcast_abort(channel, result.task_id)
@@ -666,6 +667,7 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
         # 1. Structural validation (pubkey lengths, amount, concept, etc.)
         errors = t.validate()
         if errors:
+            state.transactions_rejected_total += 1
             return JSONResponse(
                 status_code=400,
                 content=ErrorResponse(error="; ".join(errors)).model_dump(),
@@ -673,6 +675,7 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
 
         # 2. Signature verification (Ed25519 over tx_id)
         if not crypto_verify(t.sender_pubkey, t.tx_id.encode(), t.signature):
+            state.transactions_rejected_total += 1
             return JSONResponse(
                 status_code=400,
                 content=ErrorResponse(
@@ -683,6 +686,7 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
         # 3. Nonce validation — prevents replay attacks and limits future nonces
         current_nonce = get_nonce(redis_client, t.sender_pubkey)
         if t.nonce < current_nonce:
+            state.transactions_rejected_total += 1
             return JSONResponse(
                 status_code=400,
                 content=ErrorResponse(
@@ -693,6 +697,7 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
                 ).model_dump(),
             )
         if t.nonce > current_nonce + config.max_nonce_window:
+            state.transactions_rejected_total += 1
             return JSONResponse(
                 status_code=400,
                 content=ErrorResponse(
@@ -706,6 +711,7 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
         # 4. Authority check — only the configured authority can issue EARN
         if t.tx_type == "EARN":
             if not config.authority_pubkey:
+                state.transactions_rejected_total += 1
                 return JSONResponse(
                     status_code=400,
                     content=ErrorResponse(
@@ -713,6 +719,7 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
                     ).model_dump(),
                 )
             if t.sender_pubkey != config.authority_pubkey:
+                state.transactions_rejected_total += 1
                 return JSONResponse(
                     status_code=400,
                     content=ErrorResponse(
@@ -723,6 +730,7 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
         state.add_transaction(t)
         # Audit L2: persist so the tx survives an NCT restart
         save_pending_tx(redis_client, t)
+        state.transactions_received_total += 1
         return TransactionResponse(tx_id=t.tx_id)
 
     @app.get("/balance/{pubkey}", response_model=BalanceResponse)
@@ -795,6 +803,39 @@ def create_health_app(state: NCTState, redis_client: Any, config: NCTConfig) -> 
             if blk is not None:
                 result.append(blk.to_dict())
         return result
+
+    @app.get("/metrics", response_class=PlainTextResponse)
+    def metrics() -> PlainTextResponse:
+        """Prometheus text format metrics endpoint."""
+        from fastapi.responses import Response as PlainTextResponse
+
+        uptime = time.time() - state.start_time
+        return PlainTextResponse(
+            content=(
+                "# HELP nct_uptime_seconds Uptime of the NCT process\n"
+                "# TYPE nct_uptime_seconds gauge\n"
+                f"nct_uptime_seconds {uptime:.2f}\n"
+                "# HELP nct_chain_height Current blockchain height\n"
+                "# TYPE nct_chain_height gauge\n"
+                f"nct_chain_height {state.chain_height}\n"
+                "# HELP nct_blocks_mined_total Total blocks successfully mined\n"
+                "# TYPE nct_blocks_mined_total counter\n"
+                f"nct_blocks_mined_total {state.blocks_mined_total}\n"
+                "# HELP nct_transactions_received_total Total transactions accepted\n"
+                "# TYPE nct_transactions_received_total counter\n"
+                f"nct_transactions_received_total {state.transactions_received_total}\n"
+                "# HELP nct_transactions_rejected_total Total transactions rejected\n"
+                "# TYPE nct_transactions_rejected_total counter\n"
+                f"nct_transactions_rejected_total {state.transactions_rejected_total}\n"
+                "# HELP nct_pending_transactions Transactions waiting in mempool\n"
+                "# TYPE nct_pending_transactions gauge\n"
+                f"nct_pending_transactions {state.pool_size()}\n"
+                "# HELP nct_active_pools Pools seen recently\n"
+                "# TYPE nct_active_pools gauge\n"
+                f"nct_active_pools {state.active_pools()}\n"
+            ),
+            media_type="text/plain; charset=utf-8",
+        )
 
     return app
 

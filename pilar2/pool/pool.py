@@ -118,14 +118,17 @@ class PoolCoordinator:
 
         self._shutdown: threading.Event = threading.Event()
         self._channel: Any = None
-        self.start_time: float = 0.0
+
+        # -- prometheus counters (best-effort, no lock needed) --
+        self.start_time = time.time()
+        self.tasks_received_total: int = 0
+        self.tasks_completed_total: int = 0
 
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        self.start_time = time.time()
         conn = get_connection(url=self.rmq_url)
         self._channel = conn.channel()
 
@@ -310,6 +313,7 @@ class PoolCoordinator:
             self._current_task_id = task.task_id
             self._current_nonce_space = task.range_max - task.range_min + 1
 
+        self.tasks_received_total += 1
         publish_tasks(
             self._channel,
             block_index=task.block_index,
@@ -398,6 +402,7 @@ class PoolCoordinator:
 
         # Ack the worker's result now that it's safely forwarded
         ch.basic_ack(delivery_tag=method.delivery_tag)
+        self.tasks_completed_total += 1
 
         # M2: clear mining context under lock only if the block hasn't
         # changed since we took the snapshot (prevents wiping a new task).
@@ -537,6 +542,31 @@ class PoolCoordinator:
         @app.get("/health", response_model=HealthResponse)
         def health() -> HealthResponse:
             return HealthResponse(status="ok")
+
+        @app.get("/metrics")
+        def metrics():
+            """Prometheus text format metrics endpoint."""
+            from fastapi.responses import Response
+
+            uptime = time.time() - self.start_time
+            workers = len(self._worker_heartbeats)
+            return Response(
+                content=(
+                    "# HELP pool_uptime_seconds Uptime of the pool process\n"
+                    "# TYPE pool_uptime_seconds gauge\n"
+                    f"pool_uptime_seconds {uptime:.2f}\n"
+                    "# HELP pool_tasks_received_total Mining tasks received\n"
+                    "# TYPE pool_tasks_received_total counter\n"
+                    f"pool_tasks_received_total {self.tasks_received_total}\n"
+                    "# HELP pool_tasks_completed_total Results forwarded to NCT\n"
+                    "# TYPE pool_tasks_completed_total counter\n"
+                    f"pool_tasks_completed_total {self.tasks_completed_total}\n"
+                    "# HELP pool_active_workers Workers seen via heartbeat\n"
+                    "# TYPE pool_active_workers gauge\n"
+                    f"pool_active_workers {workers}\n"
+                ),
+                media_type="text/plain; charset=utf-8",
+            )
 
         uvicorn.run(app, host="0.0.0.0", port=self.health_port, log_level="info")
 
